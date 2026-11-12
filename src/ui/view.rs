@@ -5,7 +5,7 @@
 //! (`window::on_netinfo`). Until data arrives every field is `None` and the
 //! UI renders its "unavailable" state.
 
-pub use crate::metrics::{Memory, Traffic};
+pub use crate::metrics::{Disk, Memory, Traffic};
 use crate::net::NetInfo;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -49,6 +49,11 @@ pub struct PanelView {
     pub ram: Option<Memory>,
     /// `None` when GPU counters are unavailable.
     pub gpu: Option<f32>,
+    /// °C; `None` hides the temperature (no readable sensor).
+    pub cpu_temp: Option<f32>,
+    pub gpu_temp: Option<f32>,
+    /// Active time and read / write rates; `None` when unavailable.
+    pub disk: Option<Disk>,
     /// Download / upload rate; `None` until the first sample.
     pub traffic: Option<Traffic>,
     /// Internet access as Windows reports it; `None` when unknown.
@@ -100,6 +105,48 @@ pub fn compact_percent(value: Option<f32>) -> String {
         Some(v) => format!("{}%", round_percent(v)),
         None => "N/A".to_owned(),
     }
+}
+
+/// Rounds a temperature for display and color classification.
+pub fn round_celsius(value: f32) -> u32 {
+    if value.is_nan() {
+        0
+    } else {
+        value.clamp(0.0, 999.0).round() as u32
+    }
+}
+
+/// Strip form: "58°".
+pub fn compact_temp(celsius: f32) -> String {
+    format!("{}°", round_celsius(celsius))
+}
+
+/// Tooltip form: "58 °C".
+pub fn temp_text(celsius: f32) -> String {
+    format!("{} °C", round_celsius(celsius))
+}
+
+/// "R 4.1 · W 0.3 MB/s": both rates in the unit of the larger one, so they
+/// compare at a glance.
+pub fn disk_rates_text(read: f64, write: f64) -> String {
+    let clean = |v: f64| if v.is_finite() { v.max(0.0) } else { 0.0 };
+    let (read, write) = (clean(read), clean(write));
+    let (_, unit) = rate_parts(read.max(write));
+    let div = match unit {
+        "B/s" => 1.0,
+        "KB/s" => 1024.0,
+        "MB/s" => 1024.0 * 1024.0,
+        _ => 1024.0 * 1024.0 * 1024.0,
+    };
+    let num = |v: f64| {
+        let v = v / div;
+        if div > 1.0 && v < 9.95 {
+            format!("{v:.1}")
+        } else {
+            format!("{v:.0}")
+        }
+    };
+    format!("R {} · W {} {unit}", num(read), num(write))
 }
 
 /// "10.1 / 16.0 GB" using binary gigabytes, like Task Manager.
@@ -202,6 +249,24 @@ mod tests {
             assert!(n.len() <= 4 && u.len() <= 4, "{v}: {n} {u}");
         }
         assert_eq!(rate_text(84.0 * 1024.0), "84 KB/s");
+    }
+
+    #[test]
+    fn temps_format_both_forms() {
+        assert_eq!(compact_temp(57.6), "58°");
+        assert_eq!(temp_text(51.2), "51 °C");
+        assert_eq!(round_celsius(f32::NAN), 0);
+        assert_eq!(round_celsius(-5.0), 0);
+    }
+
+    #[test]
+    fn disk_rates_share_the_larger_unit() {
+        const MIB: f64 = 1024.0 * 1024.0;
+        assert_eq!(disk_rates_text(4.1 * MIB, 0.3 * MIB), "R 4.1 · W 0.3 MB/s");
+        assert_eq!(disk_rates_text(0.0, 120.0 * MIB), "R 0.0 · W 120 MB/s");
+        assert_eq!(disk_rates_text(512.0, 0.0), "R 512 · W 0 B/s");
+        assert_eq!(disk_rates_text(0.0, 0.0), "R 0 · W 0 B/s");
+        assert_eq!(disk_rates_text(f64::NAN, -1.0), "R 0 · W 0 B/s");
     }
 
     #[test]

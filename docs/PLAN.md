@@ -4,7 +4,7 @@
 
 WinHelper is a small, always-available desktop panel for Windows 10/11 that shows at a glance:
 
-- **System load**: CPU usage, memory usage, GPU usage
+- **System load**: CPU usage, memory usage, GPU usage, disk activity (active time, read / write rates), CPU and GPU temperature
 - **Network**: internet status, download / upload speed, current public IP, local (LAN) IP, and the approximate geographic location of the public IP
 
 Non-goals for v1: historical logging, per-process breakdown, alerts, multi-GPU detail views, cross-platform support.
@@ -21,26 +21,28 @@ Non-goals for v1: historical logging, per-process breakdown, alerts, multi-GPU d
 
 The visual spec (exact sizes, colors, all states, close button, menu) lives in `design/WinHelper.bl` (Brilliant), board **"WinHelper · Minimal"**. The older multi-row panel design on the same canvas is superseded.
 
-The panel is a minimalist one-line strip, 394 × 30 px at 96 DPI (scaled for DPI). Each item is only an icon and a value:
+The panel is a minimalist one-line strip, 30 px tall at 96 DPI (scaled for DPI) and 452 px wide, plus 26 px for each temperature sensor that reports (504 px with both). Each item is only an icon and a value; CPU and GPU add a dim temperature:
 
 ```
-┌───────────────────────────────────────────────────────────┐
-│ ▣ 42%  ▤ 63%  ▭ 18%  │  ◍ •  ↓ 1.2 MB/s  ↑  84 KB/s      │
-└───────────────────────────────────────────────────────────┘
-  CPU    RAM    GPU       internet   download   upload
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ▣ 42% 58°  ▤ 63%  ▭ 18% 51°  ▬ 12%  │  ◍ •  ↓ 1.2 MB/s  ↑  84 KB/s      │
+└──────────────────────────────────────────────────────────────────────────┘
+  CPU        RAM    GPU        Disk      internet   download   upload
 ```
 
-Everything else lives in a **detail tooltip** (264 × 325 px) that opens below the strip after the cursor rests on it for 400 ms:
+Everything else lives in a **detail tooltip** (264 × 356 px) that opens below the strip after the cursor rests on it for 400 ms:
 
 ```
 ┌──────────────────────────────────┐
 │ SYSTEM                           │
-│ ▣ CPU                      42 %  │
+│ ▣ CPU               58 °C  42 %  │
 │ ████████░░░░░░░░░░░░░░░░░░░░░░░  │
 │ ▤ RAM        10.1 / 16.0 GB 63 % │
 │ ████████████░░░░░░░░░░░░░░░░░░░  │
-│ ▭ GPU                      18 %  │
+│ ▭ GPU               51 °C  18 %  │
 │ ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │
+│ ▬ Disk  R 4.1 · W 0.3 MB/s 12 %  │
+│ ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │
 │──────────────────────────────────│
 │ NETWORK                ● Online  │
 │ Public IP          203.0.113.42  │
@@ -58,7 +60,9 @@ Behavior:
 - Drag anywhere to move. Position is saved and restored on next launch.
 - Hovering the strip lightens its border and shows a 22 px close button 6 px beside it, vertically centered (flipped to the left near the work-area edge). Clicking it hides the strip to the tray; Exit stays in the menu.
 - The tooltip opens after 400 ms of hover, below the strip (above it near the bottom of the work area, shifted to stay inside it horizontally). It follows the strip when dragged, refreshes live while open, is click-through, and closes when the hover ends or the context menu opens.
-- Icons are Segoe MDL2 Assets glyphs (also in Segoe Fluent Icons): CPU `E950`, RAM `E964`, GPU `E7F4`, globe `E774`, arrows `E74B` / `E74A`. Numbers sit in fixed-width slots so the strip never shifts.
+- Icons are Segoe MDL2 Assets glyphs (also in Segoe Fluent Icons): CPU `E950`, RAM `E964`, GPU `E7F4`, disk `EDA2`, globe `E774`, arrows `E74B` / `E74A`. Numbers sit in fixed-width slots so the strip never shifts.
+- Temperatures (°C) follow the CPU / GPU percentage, dimmed like a unit: amber at 75–89 °C, red at 90 °C and up. Without a readable sensor the temperature and its slot are left out; the strip resizes (keeping its right edge) when a sensor appears or disappears.
+- Disk shows active time with the same load colors; the tooltip adds read / write per second over all physical disks, both in the unit of the larger rate.
 - Internet status: green dot when online, red globe and dot when offline, gray while unknown. The transfer rates gray out while offline.
 - Right-click (panel or tray icon) opens a context menu:
   - Always on top (toggle)
@@ -82,6 +86,9 @@ Behavior:
 | Window and rendering | Win32 `CreateWindowExW` + GDI | Double-buffered painting into a memory DC |
 | CPU and RAM | `GetSystemTimes`, `GlobalMemoryStatusEx` | Optionally PDH for Task Manager parity |
 | GPU | PDH (Performance Data Helper) counters | `\GPU Engine(*)\Utilization Percentage` |
+| Disk | PDH | `\PhysicalDisk(_Total)\% Idle Time`, `Disk Read / Write Bytes/sec` |
+| CPU temperature | PDH | `\Thermal Zone Information(*)\High Precision Temperature` (ACPI zones, no admin) |
+| GPU temperature | D3DKMT (`Wdk_Graphics_Direct3D`) | `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERPERFDATA)`, WDDM 2.4+ |
 | HTTP | WinHTTP (`WinHttpOpen`/`WinHttpSendRequest`…) | Avoids `reqwest`/`tokio` and their binary size |
 | JSON | `serde_json` + `serde` (or a tiny manual parser) | Responses are small and flat |
 | Local IP | `GetAdaptersAddresses` (IP Helper) | |
@@ -147,7 +154,10 @@ winhelper/
    │  ├─ mod.rs             # MetricsSnapshot, sampler loop
    │  ├─ cpu.rs
    │  ├─ memory.rs
-   │  ├─ gpu.rs             # PDH-based GPU utilization
+   │  ├─ gpu.rs             # PDH-based GPU utilization, D3DKMT GPU temperature
+   │  ├─ disk.rs            # PDH PhysicalDisk active time and read / write rates
+   │  ├─ thermal.rs         # PDH thermal zones → CPU temperature
+   │  ├─ pdh.rs             # PDH query RAII + value / array helpers
    │  ├─ traffic.rs         # GetIfTable2 byte-counter rates
    │  └─ connectivity.rs    # GetNetworkConnectivityHint (loaded at run time)
    ├─ net/
@@ -193,6 +203,21 @@ Windows exposes GPU load via PDH (WDDM 2.0+, Windows 10 1709+):
 Optional extra: VRAM usage via `\GPU Adapter Memory(*)\Dedicated Usage`, with the adapter total from DXGI `IDXGIAdapter3::QueryVideoMemoryInfo`. Adapter names come from DXGI (`EnumAdapters1` → `DXGI_ADAPTER_DESC1`, matched by LUID).
 
 If the counters are unavailable (old driver, RDP session, VM), show `GPU  N/A` instead of failing.
+
+**Temperature**: adapters from `D3DKMTEnumAdapters2` (handles opened once, closed on drop), then `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERPERFDATA)` per adapter; `Temperature` is in tenths of °C. Adapters reading 0 (no sensor, e.g. Microsoft Basic Render Driver) or outside 1–150 °C are skipped; the hottest one is shown. None left → the temperature is hidden.
+
+### 5.3a Disk
+
+- PDH `\PhysicalDisk(_Total)\% Idle Time`, `\Disk Read Bytes/sec`, `\Disk Write Bytes/sec` in one query (baseline collection at open, rates averaged over the sampling interval).
+- Active time = 100 − idle, clamped to 0–100 % (Task Manager's "Active time"; `_Total` averages the disks). Missing counters (`diskperf -N`) → Disk `N/A`.
+
+### 5.3b CPU temperature
+
+Windows has no documented per-core sensor API. The ACPI thermal zones are readable without admin through PDH `\Thermal Zone Information(*)\High Precision Temperature` (tenths of a kelvin; falls back to `Temperature` in kelvin). The hottest zone is shown. Caveats:
+
+- On many desktops a zone is a motherboard or package sensor, not the hottest core, so it reads lower than vendor tools.
+- Many boards expose placeholder zones stuck at a constant value (typically 301 K = 27.85 °C). A zone only counts once its reading has changed, so the temperature appears a few samples after start, and never on machines with only placeholder zones.
+- WMI `MSAcpi_ThermalZoneTemperature` needs admin and reads the same zones; vendor drivers (e.g. a ring-0 MSR reader) are out of scope.
 
 ### 5.4 Local IP
 
@@ -310,6 +335,7 @@ Targets: `x86_64-pc-windows-msvc` (primary) and `aarch64-pc-windows-msvc` (optio
   - Settings load/save round-trip and defaults when the file is corrupt
 - **Integration and manual checks**:
   - Compare CPU, RAM, and GPU values against Task Manager under load (e.g. a stress tool or a game)
+  - Compare disk active time and read / write rates with Task Manager's Disk graphs during a large file copy; compare the GPU temperature with Task Manager's GPU page and the CPU temperature with a vendor tool (expect the ACPI zone to read lower); on a machine without sensors the temperature slots stay hidden
   - Switch Wi-Fi ↔ Ethernet and connect/disconnect a VPN; the IP and location should update within about 5 s
   - Run offline; the app should keep running and show stale or N/A values, a red globe and grayed rates; reconnecting should turn the dot green and refresh the IP
   - Compare download / upload speed with Task Manager's Ethernet / Wi-Fi graphs during a large download, also with a VPN connected (no double counting)
@@ -336,6 +362,6 @@ Targets: `x86_64-pc-windows-msvc` (primary) and `aarch64-pc-windows-msvc` (optio
 ## 11. Future ideas (post-v1)
 
 - Sparkline history (last 60 s) for each metric, in the tooltip
-- Disk activity and free space
-- CPU/GPU temperature (needs vendor APIs or WMI; non-trivial)
+- Disk free space
+- Per-core CPU temperature (needs a vendor driver; the ACPI zone reading is what v1 shows)
 - Click-through mode (`WS_EX_TRANSPARENT`) for gaming overlays

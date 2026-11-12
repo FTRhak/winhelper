@@ -10,10 +10,10 @@ use windows::Win32::Graphics::Gdi::{
 use super::gdi::{fill, frame, round_rect, text, text_width, Font};
 use super::layout::*;
 use super::scale;
-use super::theme::{Load, Palette};
+use super::theme::{Heat, Load, Palette};
 use super::view::{
-    compact_percent, footer_text, memory_text, percent_text, rate_parts, rate_text, round_percent,
-    PanelView, Status,
+    compact_percent, compact_temp, disk_rates_text, footer_text, memory_text, percent_text,
+    rate_parts, rate_text, round_celsius, round_percent, temp_text, PanelView, Status,
 };
 
 /// Segoe MDL2 Assets code points (also present in Segoe Fluent Icons).
@@ -21,6 +21,7 @@ mod glyph {
     pub const CPU: &str = "\u{E950}"; // Processing
     pub const RAM: &str = "\u{E964}"; // Memory
     pub const GPU: &str = "\u{E7F4}"; // TVMonitor
+    pub const DISK: &str = "\u{EDA2}"; // HardDrive
     pub const GLOBE: &str = "\u{E774}";
     pub const DOWN: &str = "\u{E74B}";
     pub const UP: &str = "\u{E74A}";
@@ -164,13 +165,28 @@ impl StripPaint<'_> {
 
         let v = self.view;
         let mut x = PAD_X;
-        for (icon, value) in [
-            (glyph::CPU, v.cpu),
-            (glyph::RAM, v.ram.map(|m| m.percent())),
-            (glyph::GPU, v.gpu),
+        for (icon, value, temp) in [
+            (glyph::CPU, v.cpu, v.cpu_temp),
+            (glyph::RAM, v.ram.map(|m| m.percent()), None),
+            (glyph::GPU, v.gpu, v.gpu_temp),
+            (glyph::DISK, v.disk.map(|d| d.active), None),
         ] {
             self.metric(dc, &px, x, icon, value);
-            x += METRIC_ITEM + ITEM_GAP;
+            x += METRIC_ITEM;
+            if let Some(celsius) = temp {
+                let r = px.rect(x + TEMP_GAP, 0, TEMP_SLOT, STRIP_HEIGHT);
+                let color = Heat::of(round_celsius(celsius)).text_color(p);
+                text(
+                    dc,
+                    &self.fonts.unit,
+                    color,
+                    &r,
+                    &compact_temp(celsius),
+                    DT_LEFT,
+                );
+                x += TEMP_ITEM;
+            }
+            x += ITEM_GAP;
         }
 
         let sep = px.rect(
@@ -311,14 +327,29 @@ impl TipPaint<'_> {
 
         let r = px.rect(TIP_PAD_X, TIP_SYS_HEADER, inner, TIP_HEADER_H);
         text(dc, &self.fonts.caption, p.secondary, &r, "SYSTEM", DT_LEFT);
+        // Detail before the percentage: temperature, memory use, disk rates.
+        let temp =
+            |t: Option<f32>| t.map(|c| (temp_text(c), Heat::of(round_celsius(c)).text_color(p)));
         let metrics = [
-            (glyph::CPU, "CPU", v.cpu, None),
-            (glyph::RAM, "RAM", v.ram.map(|m| m.percent()), v.ram),
-            (glyph::GPU, "GPU", v.gpu, None),
+            (glyph::CPU, "CPU", v.cpu, temp(v.cpu_temp)),
+            (
+                glyph::RAM,
+                "RAM",
+                v.ram.map(|m| m.percent()),
+                v.ram.map(|m| (memory_text(m), p.secondary)),
+            ),
+            (glyph::GPU, "GPU", v.gpu, temp(v.gpu_temp)),
+            (
+                glyph::DISK,
+                "Disk",
+                v.disk.map(|d| d.active),
+                v.disk
+                    .map(|d| (disk_rates_text(d.read, d.write), p.secondary)),
+            ),
         ];
-        for (i, (icon, label, value, mem)) in metrics.into_iter().enumerate() {
+        for (i, (icon, label, value, detail)) in metrics.into_iter().enumerate() {
             let top = TIP_METRIC0 + i as i32 * TIP_METRIC_STEP;
-            self.metric(dc, &px, top, icon, label, value, mem.map(memory_text));
+            self.metric(dc, &px, top, icon, label, value, detail);
         }
 
         self.separator(dc, &px, TIP_SEP1);
@@ -425,7 +456,7 @@ impl TipPaint<'_> {
         icon: &str,
         label: &str,
         value: Option<f32>,
-        detail: Option<String>,
+        detail: Option<(String, COLORREF)>,
     ) {
         let p = self.palette;
         let inner = TIP_WIDTH - 2 * TIP_PAD_X;
@@ -439,13 +470,13 @@ impl TipPaint<'_> {
         let s = percent_text(value);
         let row = px.rect(TIP_PAD_X, top, inner, TIP_ROW_H);
         text(dc, &self.fonts.value, value_color, &row, &s, DT_RIGHT);
-        if let Some(detail) = detail {
+        if let Some((detail, color)) = detail {
             let w = text_width(dc, &self.fonts.value, &s) + px.v(TIP_DETAIL_GAP);
             let r = RECT {
                 right: row.right - w,
                 ..row
             };
-            text(dc, &self.fonts.detail, p.secondary, &r, &detail, DT_RIGHT);
+            text(dc, &self.fonts.detail, color, &r, &detail, DT_RIGHT);
         }
 
         let track = px.rect(TIP_PAD_X, top + TIP_ROW_H + TIP_BAR_GAP, inner, TIP_BAR_H);

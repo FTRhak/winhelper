@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::close_button::{self, WM_APP_HIDE_PANEL};
 use super::gdi::{BackBuffer, PaintGuard};
-use super::layout::{STRIP_HEIGHT, STRIP_WIDTH};
+use super::layout::{strip_width, STRIP_HEIGHT};
 use super::menu::{self, Command, MenuState};
 use super::paint::{Fonts, StripPaint};
 use super::scale;
@@ -190,11 +190,14 @@ fn on_metrics(hwnd: HWND) {
     let changed = state::with(|ui| {
         let snap = ui.sampler.as_ref().and_then(Sampler::take_latest)?;
         let v = &mut ui.view;
-        let before = (v.cpu, v.ram, v.gpu, v.traffic, v.online);
+        let before = v.clone();
         let reconnected = v.online == Some(false) && snap.online == Some(true);
         v.cpu = snap.cpu;
         v.ram = snap.ram;
         v.gpu = snap.gpu;
+        v.cpu_temp = snap.cpu_temp;
+        v.gpu_temp = snap.gpu_temp;
+        v.disk = snap.disk;
         v.traffic = snap.traffic;
         v.online = snap.online;
         if reconnected {
@@ -202,10 +205,14 @@ fn on_metrics(hwnd: HWND) {
                 net.refresh();
             }
         }
-        let after = (v.cpu, v.ram, v.gpu, v.traffic, v.online);
-        (before != after).then_some(ui.tip)
+        let resized = (before.cpu_temp.is_some(), before.gpu_temp.is_some())
+            != (v.cpu_temp.is_some(), v.gpu_temp.is_some());
+        (before != *v).then_some((ui.tip, resized))
     });
-    if let Some(Some(tip)) = changed {
+    if let Some(Some((tip, resized))) = changed {
+        if resized {
+            fit_to_content(hwnd);
+        }
         invalidate(hwnd);
         invalidate(tip);
     }
@@ -276,8 +283,39 @@ pub fn update_border(hwnd: HWND) {
     }
 }
 
-fn panel_size(dpi: u32) -> (i32, i32) {
-    (scale(STRIP_WIDTH, dpi), scale(STRIP_HEIGHT, dpi))
+/// Strip size in device pixels; temperature slots only for sensors that report.
+fn panel_size(dpi: u32, view: &PanelView) -> (i32, i32) {
+    let width = strip_width(view.cpu_temp.is_some(), view.gpu_temp.is_some());
+    (scale(width, dpi), scale(STRIP_HEIGHT, dpi))
+}
+
+/// Current strip size from the UI state (zero before `state::init`).
+fn current_panel_size() -> (i32, i32) {
+    state::with(|ui| panel_size(ui.dpi, &ui.view)).unwrap_or_default()
+}
+
+/// Resizes the strip to its content, keeping the right edge in place (the
+/// panel starts in the top-right corner), and moves the close button along.
+fn fit_to_content(hwnd: HWND) {
+    let (w, h) = current_panel_size();
+    let mut r = RECT::default();
+    // SAFETY: hwnd is a valid window owned by this thread.
+    unsafe {
+        if GetWindowRect(hwnd, &mut r).is_err() || r.right - r.left == w {
+            return;
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            r.right - w,
+            r.top,
+            w,
+            h,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    invalidate(hwnd);
+    follow_strip(hwnd);
 }
 
 /// Sizes the panel for its monitor DPI and puts it in the top-right corner of the
@@ -286,7 +324,7 @@ fn place_initial(hwnd: HWND) {
     // SAFETY: hwnd is a valid window owned by this thread.
     unsafe {
         let dpi = GetDpiForWindow(hwnd);
-        let (w, h) = panel_size(dpi);
+        let (w, h) = current_panel_size();
         let margin = scale(SCREEN_MARGIN, dpi);
 
         let mut work = RECT::default();
@@ -315,7 +353,7 @@ fn on_paint(hwnd: HWND) {
         return;
     }
     state::with(|ui| {
-        let (width, height) = panel_size(ui.dpi);
+        let (width, height) = panel_size(ui.dpi, &ui.view);
         let Some(buffer) = BackBuffer::new(guard.hdc, width, height) else {
             return;
         };
@@ -645,7 +683,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 // lparam points to the suggested new window rect; keep its origin
                 // and use the exact layout size for the new DPI.
                 let r = &*(lparam.0 as *const RECT);
-                let (w, h) = panel_size(dpi);
+                let (w, h) = current_panel_size();
                 let _ = SetWindowPos(
                     hwnd,
                     None,

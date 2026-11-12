@@ -6,7 +6,7 @@
 //! release builds.
 
 use super::theme::Theme;
-use super::view::{Memory, NetView, PanelView, Traffic};
+use super::view::{Disk, Memory, NetView, PanelView, Traffic};
 
 const GIB: u64 = 1 << 30;
 const KIB: f64 = 1024.0;
@@ -39,6 +39,13 @@ pub fn view() -> Option<PanelView> {
             cpu: Some(91.0),
             ram: Some(mem(125)),
             gpu: None,
+            cpu_temp: Some(92.0),
+            gpu_temp: None,
+            disk: Some(Disk {
+                active: 74.0,
+                read: 85.0 * MIB,
+                write: 40.0 * MIB,
+            }),
             traffic: Some(Traffic {
                 down: 24.8 * MIB,
                 up: 1.6 * MIB,
@@ -50,6 +57,13 @@ pub fn view() -> Option<PanelView> {
             cpu: Some(7.0),
             ram: Some(mem(66)),
             gpu: Some(3.0),
+            cpu_temp: Some(41.0),
+            gpu_temp: Some(38.0),
+            disk: Some(Disk {
+                active: 2.0,
+                read: 0.1 * MIB,
+                write: 0.0,
+            }),
             traffic: Some(Traffic::default()),
             online: Some(false),
             net: NetView {
@@ -62,6 +76,13 @@ pub fn view() -> Option<PanelView> {
             cpu: Some(42.0),
             ram: Some(mem(101)),
             gpu: Some(18.0),
+            cpu_temp: Some(58.0),
+            gpu_temp: Some(51.0),
+            disk: Some(Disk {
+                active: 12.0,
+                read: 4.1 * MIB,
+                write: 0.3 * MIB,
+            }),
             traffic: Some(Traffic {
                 down: 1.2 * MIB,
                 up: 84.0 * KIB,

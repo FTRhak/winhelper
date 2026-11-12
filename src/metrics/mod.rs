@@ -1,15 +1,18 @@
 //! System load sampling on a background thread (PLAN.md §4, §5.1–5.3, §5.6).
 //!
-//! The sampler reads CPU, RAM and GPU load, network throughput and internet
-//! connectivity, stores the latest `MetricsSnapshot`
-//! in shared state and posts `WM_APP_METRICS` to the panel. It samples every
-//! `FAST_INTERVAL` while the panel is active (focused or hovered) and every
-//! `SLOW_INTERVAL` otherwise.
+//! The sampler reads CPU, RAM, GPU and disk load, CPU / GPU temperature,
+//! network throughput and internet connectivity, stores the latest
+//! `MetricsSnapshot` in shared state and posts `WM_APP_METRICS` to the panel.
+//! It samples every `FAST_INTERVAL` while the panel is active (focused or
+//! hovered) and every `SLOW_INTERVAL` otherwise.
 
 mod connectivity;
 mod cpu;
+mod disk;
 mod gpu;
 mod memory;
+mod pdh;
+mod thermal;
 mod traffic;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +24,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::win::Event;
+pub use disk::Disk;
 pub use memory::Memory;
 pub use traffic::Traffic;
 
@@ -38,6 +42,11 @@ pub struct MetricsSnapshot {
     pub cpu: Option<f32>,
     pub ram: Option<Memory>,
     pub gpu: Option<f32>,
+    /// °C; `None` when no sensor is readable.
+    pub cpu_temp: Option<f32>,
+    pub gpu_temp: Option<f32>,
+    /// Disk activity since the previous sample.
+    pub disk: Option<Disk>,
     /// Throughput averaged since the previous sample.
     pub traffic: Option<Traffic>,
     /// Internet access per Windows; `None` when unknown.
@@ -115,6 +124,9 @@ fn remaining(last: Instant, now: Instant, interval: Duration) -> Option<Duration
 fn run(shared: &Shared, panel: isize) {
     let mut cpu = cpu::CpuSampler::new();
     let mut gpu = gpu::GpuSampler::open();
+    let gpu_temp = gpu::GpuTemp::open();
+    let mut cpu_temp = thermal::CpuTemp::open();
+    let mut disk = disk::DiskSampler::open();
     let mut traffic = traffic::TrafficSampler::new();
     let connectivity = connectivity::Connectivity::new();
     let mut last = Instant::now();
@@ -141,6 +153,9 @@ fn run(shared: &Shared, panel: isize) {
             cpu: cpu.sample(),
             ram: memory::read(),
             gpu: gpu.as_mut().and_then(gpu::GpuSampler::sample),
+            cpu_temp: cpu_temp.as_mut().and_then(thermal::CpuTemp::sample),
+            gpu_temp: gpu_temp.as_ref().and_then(gpu::GpuTemp::sample),
+            disk: disk.as_mut().and_then(disk::DiskSampler::sample),
             traffic: traffic.sample(),
             online: connectivity.online(),
         };
@@ -180,13 +195,18 @@ mod live {
         let mut cpu = super::cpu::CpuSampler::new();
         let mut gpu = super::gpu::GpuSampler::open();
         let mut traffic = super::traffic::TrafficSampler::new();
+        let mut disk = super::disk::DiskSampler::open();
         std::thread::sleep(super::FAST_INTERVAL);
         let cpu = cpu.sample();
         let ram = super::memory::read();
         let gpu = gpu.as_mut().and_then(super::gpu::GpuSampler::sample);
         let traffic = traffic.sample();
+        let disk = disk.as_mut().and_then(super::disk::DiskSampler::sample);
+        let cpu_temp = super::thermal::CpuTemp::open().and_then(|mut t| t.sample());
+        let gpu_temp = super::gpu::GpuTemp::open().and_then(|t| t.sample());
         let online = super::connectivity::Connectivity::new().online();
         println!("cpu {cpu:?}  ram {ram:?}  gpu {gpu:?}  traffic {traffic:?}  online {online:?}");
+        println!("disk {disk:?}  cpu temp {cpu_temp:?}  gpu temp {gpu_temp:?}");
         assert!(cpu.is_some_and(|v| (0.0..=100.0).contains(&v)));
         assert!(ram.is_some_and(|m| m.used <= m.total && m.total > 0));
         assert!(traffic.is_some());

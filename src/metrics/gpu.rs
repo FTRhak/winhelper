@@ -5,15 +5,19 @@
 //! `pid_1234_luid_0x00000000_0x0000C2A1_phys_0_eng_3_engtype_3D`. Like Task
 //! Manager, utilization is summed per engine across processes and the busiest
 //! engine of any adapter is reported.
+//!
+//! The temperature comes from D3DKMT adapter performance data (`GpuTemp`).
 
 use std::collections::HashMap;
 
 use windows::core::w;
-use windows::Win32::System::Performance::{
-    PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
-    PdhOpenQueryW, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE_ITEM_W,
-    PDH_FMT_DOUBLE, PDH_MORE_DATA,
+use windows::Wdk::Graphics::Direct3D::{
+    D3DKMTCloseAdapter, D3DKMTEnumAdapters2, D3DKMTQueryAdapterInfo, D3DKMT_ADAPTERINFO,
+    D3DKMT_ADAPTER_PERFDATA, D3DKMT_CLOSEADAPTER, D3DKMT_ENUMADAPTERS2, D3DKMT_QUERYADAPTERINFO,
+    KMTQAITYPE_ADAPTERPERFDATA,
 };
+
+use super::pdh::{self, Counter, Query};
 
 /// Engine key of an instance name: everything from `luid_` up to `_engtype_`
 /// (adapter, physical node and engine index), or `None` if it is not a GPU engine.
@@ -44,22 +48,10 @@ pub fn aggregate<'a>(samples: impl IntoIterator<Item = (&'a str, f64)>) -> Optio
         .map(|max| max.clamp(0.0, 100.0) as f32)
 }
 
-/// Owned PDH query handle.
-struct Query(isize);
-
-impl Drop for Query {
-    fn drop(&mut self) {
-        // SAFETY: we own the query and close it exactly once.
-        unsafe {
-            PdhCloseQuery(self.0);
-        }
-    }
-}
-
 pub struct GpuSampler {
     query: Query,
-    counter: isize,
-    /// Reused item buffer; u64 elements keep it 8-byte aligned for the items.
+    counter: Counter,
+    /// Reused PDH item buffer.
     buffer: Vec<u64>,
 }
 
@@ -67,93 +59,92 @@ impl GpuSampler {
     /// Opens the query and takes the baseline collection. `None` when the GPU
     /// counters are unavailable (old WDDM driver, some VMs / RDP sessions).
     pub fn open() -> Option<Self> {
-        let mut handle = 0;
-        // SAFETY: plain FFI calls with valid out-pointers.
-        unsafe {
-            if PdhOpenQueryW(None, 0, &mut handle) != 0 {
-                return None;
-            }
-            let query = Query(handle);
-            let mut counter = 0;
-            let path = w!("\\GPU Engine(*)\\Utilization Percentage");
-            if PdhAddEnglishCounterW(query.0, path, 0, &mut counter) != 0 {
-                return None;
-            }
-            // Rate counters need two collections; this is the first.
-            PdhCollectQueryData(query.0);
-            Some(Self {
-                query,
-                counter,
-                buffer: Vec::new(),
-            })
-        }
+        let query = Query::open()?;
+        let counter = query.add(w!("\\GPU Engine(*)\\Utilization Percentage"))?;
+        // Rate counters need two collections; this is the first.
+        query.collect();
+        Some(Self {
+            query,
+            counter,
+            buffer: Vec::new(),
+        })
     }
 
     /// Load since the previous call, in percent.
     pub fn sample(&mut self) -> Option<f32> {
-        // SAFETY: the query and counter handles are valid while `self` lives.
-        if unsafe { PdhCollectQueryData(self.query.0) } != 0 {
+        if !self.query.collect() {
             return None;
         }
-        // Instances come and go with processes, so the size can change between the
-        // size query and the fetch; retry a few times.
-        for _ in 0..3 {
-            let (mut size, mut count) = (0u32, 0u32);
-            // SAFETY: size query with no buffer, as documented.
-            let status = unsafe {
-                PdhGetFormattedCounterArrayW(
-                    self.counter,
-                    PDH_FMT_DOUBLE,
-                    &mut size,
-                    &mut count,
-                    None,
-                )
-            };
-            if status != PDH_MORE_DATA {
-                return None;
-            }
-            self.buffer.clear();
-            self.buffer.resize((size as usize).div_ceil(8), 0);
-            let items = self
-                .buffer
-                .as_mut_ptr()
-                .cast::<PDH_FMT_COUNTERVALUE_ITEM_W>();
-            // SAFETY: the buffer holds at least `size` bytes, suitably aligned.
-            let status = unsafe {
-                PdhGetFormattedCounterArrayW(
-                    self.counter,
-                    PDH_FMT_DOUBLE,
-                    &mut size,
-                    &mut count,
-                    Some(items),
-                )
-            };
-            if status == PDH_MORE_DATA {
-                continue;
-            }
-            if status != 0 {
-                return None;
-            }
-            // SAFETY: PDH wrote `count` items into the buffer; their name strings
-            // point into the same buffer, which outlives this borrow.
-            let items = unsafe { std::slice::from_raw_parts(items, count as usize) };
-            let samples: Vec<(String, f64)> = items
-                .iter()
-                .filter(|item| {
-                    matches!(
-                        item.FmtValue.CStatus,
-                        PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA
-                    )
-                })
-                // SAFETY: valid items carry a NUL-terminated name and a double value.
-                .filter_map(|item| unsafe {
-                    let name = item.szName.to_string().ok()?;
-                    Some((name, item.FmtValue.Anonymous.doubleValue))
-                })
-                .collect();
-            return aggregate(samples.iter().map(|(n, v)| (n.as_str(), *v)));
+        let samples = pdh::array(self.counter, &mut self.buffer)?;
+        aggregate(samples.iter().map(|(n, v)| (n.as_str(), *v)))
+    }
+}
+
+/// Temperature of the hottest GPU in °C from the driver's deci-Celsius readings,
+/// ignoring adapters that report nothing (0, e.g. Microsoft Basic Render
+/// Driver) or nonsense. `None` if no adapter has a plausible reading.
+pub fn hottest(deci_celsius: impl IntoIterator<Item = u32>) -> Option<f32> {
+    deci_celsius
+        .into_iter()
+        .map(|d| d as f32 / 10.0)
+        .filter(|c| (1.0..=150.0).contains(c))
+        .reduce(f32::max)
+}
+
+/// GPU temperature through D3DKMT adapter performance data (WDDM 2.4+), the
+/// source Task Manager uses. Adapter handles are opened once and closed on drop.
+pub struct GpuTemp {
+    adapters: Vec<u32>,
+}
+
+impl GpuTemp {
+    /// `None` when no adapter reports a temperature (old driver, VM, iGPU without
+    /// a sensor), so the UI hides the GPU temperature.
+    pub fn open() -> Option<Self> {
+        let mut enumerate = D3DKMT_ENUMADAPTERS2::default();
+        // SAFETY: a null adapter array asks for the count only.
+        if unsafe { D3DKMTEnumAdapters2(&mut enumerate) }.is_err() || enumerate.NumAdapters == 0 {
+            return None;
         }
-        None
+        let mut infos = vec![D3DKMT_ADAPTERINFO::default(); enumerate.NumAdapters as usize];
+        enumerate.pAdapters = infos.as_mut_ptr();
+        // SAFETY: the array holds NumAdapters entries.
+        if unsafe { D3DKMTEnumAdapters2(&mut enumerate) }.is_err() {
+            return None;
+        }
+        infos.truncate(enumerate.NumAdapters as usize);
+        let temp = Self {
+            adapters: infos.iter().map(|a| a.hAdapter).collect(),
+        };
+        // Keep the handles only if a sensor answers now; drop closes them otherwise.
+        temp.sample().map(|_| temp)
+    }
+
+    pub fn sample(&self) -> Option<f32> {
+        hottest(self.adapters.iter().filter_map(|&adapter| {
+            let mut data = D3DKMT_ADAPTER_PERFDATA::default();
+            let mut query = D3DKMT_QUERYADAPTERINFO {
+                hAdapter: adapter,
+                Type: KMTQAITYPE_ADAPTERPERFDATA,
+                pPrivateDriverData: &mut data as *mut _ as *mut _,
+                PrivateDriverDataSize: std::mem::size_of::<D3DKMT_ADAPTER_PERFDATA>() as u32,
+            };
+            // SAFETY: `data` is the documented output struct and outlives the call.
+            unsafe { D3DKMTQueryAdapterInfo(&mut query) }
+                .is_ok()
+                .then_some(data.Temperature)
+        }))
+    }
+}
+
+impl Drop for GpuTemp {
+    fn drop(&mut self) {
+        for &adapter in &self.adapters {
+            // SAFETY: each handle came from D3DKMTEnumAdapters2 and is closed once.
+            unsafe {
+                let _ = D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER { hAdapter: adapter });
+            }
+        }
     }
 }
 
@@ -215,5 +206,14 @@ mod tests {
     #[test]
     fn no_engines_is_none() {
         assert_eq!(aggregate(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn hottest_skips_missing_sensors() {
+        assert_eq!(hottest([0, 512, 0]), Some(51.2));
+        assert_eq!(hottest([480, 655]), Some(65.5));
+        assert_eq!(hottest([0, 0]), None);
+        assert_eq!(hottest([65535]), None);
+        assert_eq!(hottest(std::iter::empty()), None);
     }
 }

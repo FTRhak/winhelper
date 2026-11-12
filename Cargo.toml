@@ -10,6 +10,7 @@ build = "build.rs"
 [dependencies.windows]
 version = "0.58"
 features = [
+  "Wdk_Graphics_Direct3D",
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",

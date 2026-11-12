@@ -158,6 +158,35 @@ impl Load {
     }
 }
 
+/// Temperature level: the reading stays dim like a unit until it gets hot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Heat {
+    /// Below 75 °C.
+    Normal,
+    /// 75 – 89 °C.
+    Warm,
+    /// 90 °C and up.
+    Hot,
+}
+
+impl Heat {
+    pub fn of(celsius: u32) -> Self {
+        match celsius {
+            0..=74 => Heat::Normal,
+            75..=89 => Heat::Warm,
+            _ => Heat::Hot,
+        }
+    }
+
+    pub fn text_color(self, p: &Palette) -> COLORREF {
+        match self {
+            Heat::Normal => p.secondary,
+            Heat::Warm => p.elevated_value,
+            Heat::Hot => p.high_value,
+        }
+    }
+}
+
 /// Reads the app theme from `AppsUseLightTheme`. A missing value means light,
 /// matching Windows' own default.
 pub fn system_theme() -> Theme {
@@ -251,5 +280,17 @@ mod tests {
         assert_eq!(Load::Elevated.text_color(p), p.elevated_value);
         assert_eq!(Load::High.text_color(p), p.high_value);
         assert_eq!(Load::High.bar_color(&LIGHT), LIGHT.high);
+    }
+
+    #[test]
+    fn heat_thresholds_match_design() {
+        assert_eq!(Heat::of(74), Heat::Normal);
+        assert_eq!(Heat::of(75), Heat::Warm);
+        assert_eq!(Heat::of(89), Heat::Warm);
+        assert_eq!(Heat::of(90), Heat::Hot);
+        let p = &DARK;
+        assert_eq!(Heat::Normal.text_color(p), p.secondary);
+        assert_eq!(Heat::Warm.text_color(p), p.elevated_value);
+        assert_eq!(Heat::Hot.text_color(p), p.high_value);
     }
 }

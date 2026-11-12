@@ -28,13 +28,25 @@ pub const RATE_GAP: i32 = 3;
 pub const RATE_SLOT: i32 = 27;
 pub const UNIT_SLOT: i32 = 22;
 
+/// Temperature after the CPU / GPU percentage: gap, then a slot wide enough
+/// for "100°" in Consolas 10 px.
+pub const TEMP_GAP: i32 = 4;
+pub const TEMP_SLOT: i32 = 22;
+pub const TEMP_ITEM: i32 = TEMP_GAP + TEMP_SLOT;
+
 pub const METRIC_ITEM: i32 = ICON + ICON_GAP + PERCENT_SLOT;
 pub const GLOBE_ITEM: i32 = ICON + ICON_GAP + DOT;
 pub const RATE_ITEM: i32 = ARROW + RATE_GAP + RATE_SLOT + RATE_GAP + UNIT_SLOT;
 
-/// CPU, RAM, GPU | globe, down, up.
-pub const STRIP_WIDTH: i32 =
-    2 * PAD_X + 3 * METRIC_ITEM + 1 + GLOBE_ITEM + 2 * RATE_ITEM + 6 * ITEM_GAP;
+/// CPU, RAM, GPU, Disk | globe, down, up; without temperatures.
+pub const BASE_STRIP_WIDTH: i32 =
+    2 * PAD_X + 4 * METRIC_ITEM + 1 + GLOBE_ITEM + 2 * RATE_ITEM + 7 * ITEM_GAP;
+
+/// Strip width with a temperature slot for each sensor that reports one.
+/// Machines without a sensor do not carry an empty slot.
+pub const fn strip_width(cpu_temp: bool, gpu_temp: bool) -> i32 {
+    BASE_STRIP_WIDTH + (cpu_temp as i32 + gpu_temp as i32) * TEMP_ITEM
+}
 
 // ---- Close button ----------------------------------------------------------
 
@@ -70,13 +82,16 @@ pub const TIP_TAG_GAP: i32 = 6;
 pub const TIP_TAG_H: i32 = 14;
 
 pub const TIP_METRIC_H: i32 = TIP_ROW_H + TIP_BAR_GAP + TIP_BAR_H;
+/// CPU, RAM, GPU, Disk.
+pub const TIP_METRICS: i32 = 4;
 pub const TIP_NET_ROWS: i32 = 5;
 
 /// Row tops relative to the tooltip's top edge.
 pub const TIP_SYS_HEADER: i32 = TIP_PAD_Y;
 pub const TIP_METRIC0: i32 = TIP_SYS_HEADER + TIP_HEADER_H + TIP_METRIC_GAP;
 pub const TIP_METRIC_STEP: i32 = TIP_METRIC_H + TIP_METRIC_GAP;
-pub const TIP_SEP1: i32 = TIP_METRIC0 + 3 * TIP_METRIC_H + 2 * TIP_METRIC_GAP + TIP_SECTION_GAP;
+pub const TIP_SEP1: i32 =
+    TIP_METRIC0 + TIP_METRICS * TIP_METRIC_H + (TIP_METRICS - 1) * TIP_METRIC_GAP + TIP_SECTION_GAP;
 pub const TIP_NET_HEADER: i32 = TIP_SEP1 + 1 + TIP_SECTION_GAP;
 pub const TIP_NET_ROW0: i32 = TIP_NET_HEADER + TIP_ROW_H + TIP_NET_ROW_GAP;
 pub const TIP_NET_STEP: i32 = TIP_ROW_H + TIP_NET_ROW_GAP;
@@ -152,11 +167,13 @@ mod tests {
 
     #[test]
     fn strip_and_tip_sizes_match_design() {
-        assert_eq!(STRIP_WIDTH, 394);
-        assert_eq!(TIP_SEP1, 130);
-        assert_eq!(TIP_NET_HEADER, 143);
-        assert_eq!(TIP_SEP2, 286);
-        assert_eq!(TIP_HEIGHT, 325);
+        assert_eq!(strip_width(false, false), 452);
+        assert_eq!(strip_width(true, false), 478);
+        assert_eq!(strip_width(true, true), 504);
+        assert_eq!(TIP_SEP1, 161);
+        assert_eq!(TIP_NET_HEADER, 174);
+        assert_eq!(TIP_SEP2, 317);
+        assert_eq!(TIP_HEIGHT, 356);
     }
 
     #[test]
