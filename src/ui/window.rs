@@ -1,0 +1,520 @@
+//! Panel window: class, WndProc, dragging, hover / close button, tray, theme and
+//! DPI handling.
+
+use windows::core::{w, Result, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWMWCP_ROUNDSMALL,
+};
+use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos,
+    GetMessageW, GetWindowRect, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW,
+    PostQuitMessage, RegisterClassExW, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage, CS_DBLCLKS, CS_DROPSHADOW,
+    HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, LWA_ALPHA, MSG, SPI_GETWORKAREA,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOWNOACTIVATE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_LBUTTONDBLCLK, WM_MOVE, WM_NCHITTEST, WM_NCMOUSEMOVE, WM_NCRBUTTONUP, WM_PAINT,
+    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
+};
+
+use super::close_button::{self, WM_APP_HIDE_PANEL};
+use super::gdi::{BackBuffer, PaintGuard};
+use super::layout::{PANEL_HEIGHT, PANEL_WIDTH};
+use super::menu::{self, Command, MenuState};
+use super::paint::{Fonts, PanelPaint};
+use super::scale;
+use super::state::{self, Ui};
+use super::theme;
+use super::tray::{self, WM_APP_TRAY};
+use super::view::PanelView;
+
+const CLASS_NAME: PCWSTR = w!("WinHelper.Panel");
+const WINDOW_TITLE: PCWSTR = w!("WinHelper");
+
+/// Margin from the work-area corner on first placement, at 96 DPI.
+const SCREEN_MARGIN: i32 = 16;
+
+/// Resource id of the application icon (res/winhelper.rc).
+const IDI_APP: u16 = 1;
+
+/// Polls the cursor while the close button is shown, to hide it once the cursor
+/// leaves both windows (the gap between them makes leave events unreliable).
+const HOVER_TIMER: usize = 1;
+const HOVER_POLL_MS: u32 = 100;
+
+/// Brings an already running instance's panel to the front.
+pub fn activate_existing() {
+    // SAFETY: plain FFI calls on a window owned by another process.
+    unsafe {
+        if let Ok(hwnd) = FindWindowW(CLASS_NAME, PCWSTR::null()) {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+/// Registers the window classes and creates the (initially shown) panel.
+pub fn create() -> Result<HWND> {
+    // SAFETY: standard window creation on the UI thread; all pointers outlive the calls.
+    unsafe {
+        let instance = GetModuleHandleW(None)?.into();
+
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_DBLCLKS | CS_DROPSHADOW,
+            lpfnWndProc: Some(wnd_proc),
+            hInstance: instance,
+            hIcon: LoadIconW(instance, PCWSTR(IDI_APP as usize as *const u16))?,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: CLASS_NAME,
+            ..Default::default()
+        };
+        if RegisterClassExW(&class) == 0 {
+            return Err(windows::core::Error::from_win32());
+        }
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST,
+            CLASS_NAME,
+            WINDOW_TITLE,
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            instance,
+            None,
+        )?;
+        let close = close_button::create(instance, hwnd)?;
+
+        let dpi = GetDpiForWindow(hwnd);
+        let theme = theme::system_theme();
+        state::init(Ui {
+            panel: hwnd,
+            close,
+            dpi,
+            theme,
+            fonts: Fonts::new(dpi),
+            view: initial_view(),
+            hovered: false,
+            close_hovered: false,
+            topmost: true,
+            opacity: 100,
+        });
+        theme::apply_menu_theme(theme);
+
+        set_opacity(100);
+        round_corners(hwnd, false);
+        update_border(hwnd);
+        update_border(close);
+        tray::add(hwnd, IDI_APP);
+
+        place_initial(hwnd);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        Ok(hwnd)
+    }
+}
+
+/// Runs the message loop until WM_QUIT.
+pub fn run_message_loop() {
+    let mut msg = MSG::default();
+    // SAFETY: standard message pump on the thread that owns the window.
+    unsafe {
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+fn initial_view() -> PanelView {
+    #[cfg(debug_assertions)]
+    if let Some(view) = super::demo::view() {
+        return view;
+    }
+    PanelView::default()
+}
+
+/// Requests Windows 11 rounded corners (8 px, or 4 px when `small`). No-op on Windows 10.
+pub fn round_corners(hwnd: HWND, small: bool) {
+    let pref = if small {
+        DWMWCP_ROUNDSMALL
+    } else {
+        DWMWCP_ROUND
+    };
+    // SAFETY: the attribute value is a 4-byte enum, as the API expects.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &pref as *const _ as *const _,
+            std::mem::size_of_val(&pref) as u32,
+        );
+    }
+}
+
+/// Matches the Windows 11 DWM border of the panel or close button to the
+/// current theme and hover state. No-op on Windows 10, where the painted 1 px
+/// border is the only one.
+pub fn update_border(hwnd: HWND) {
+    let Some(color) = state::with(|ui| {
+        let p = ui.theme.palette();
+        if hwnd == ui.close {
+            if ui.close_hovered {
+                p.close_hover
+            } else {
+                p.close_border
+            }
+        } else if ui.hovered {
+            p.border_hover
+        } else {
+            p.border
+        }
+    }) else {
+        return;
+    };
+    // SAFETY: COLORREF is a 4-byte value, as the API expects.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &color as *const COLORREF as *const _,
+            std::mem::size_of::<COLORREF>() as u32,
+        );
+    }
+}
+
+fn panel_size(dpi: u32) -> (i32, i32) {
+    (scale(PANEL_WIDTH, dpi), scale(PANEL_HEIGHT, dpi))
+}
+
+/// Sizes the panel for its monitor DPI and puts it in the top-right corner of the
+/// primary work area. Saved positions replace this in M4.
+fn place_initial(hwnd: HWND) {
+    // SAFETY: hwnd is a valid window owned by this thread.
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd);
+        let (w, h) = panel_size(dpi);
+        let margin = scale(SCREEN_MARGIN, dpi);
+
+        let mut work = RECT::default();
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut work as *mut RECT as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let x = work.right - w - margin;
+        let y = work.top + margin;
+        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+fn invalidate(hwnd: HWND) {
+    // SAFETY: the window belongs to this thread.
+    unsafe {
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+}
+
+fn on_paint(hwnd: HWND) {
+    let guard = PaintGuard::begin(hwnd);
+    if guard.hdc.is_invalid() {
+        return;
+    }
+    state::with(|ui| {
+        let (width, height) = panel_size(ui.dpi);
+        let Some(buffer) = BackBuffer::new(guard.hdc, width, height) else {
+            return;
+        };
+        PanelPaint {
+            width,
+            height,
+            dpi: ui.dpi,
+            palette: ui.theme.palette(),
+            fonts: &ui.fonts,
+            view: &ui.view,
+            hovered: ui.hovered,
+        }
+        .draw(buffer.dc);
+        buffer.blit(guard.hdc);
+    });
+}
+
+/// Cursor entered the panel: hover border on, close button shown.
+fn on_hover(hwnd: HWND) {
+    let Some((close, dpi)) = state::with(|ui| {
+        (!ui.hovered).then(|| {
+            ui.hovered = true;
+            (ui.close, ui.dpi)
+        })
+    })
+    .flatten() else {
+        return;
+    };
+    update_border(hwnd);
+    invalidate(hwnd);
+    close_button::show_beside(close, hwnd, dpi);
+    // SAFETY: the window belongs to this thread.
+    unsafe {
+        SetTimer(hwnd, HOVER_TIMER, HOVER_POLL_MS, None);
+    }
+}
+
+fn end_hover(hwnd: HWND) {
+    let Some(close) = state::with(|ui| {
+        ui.hovered = false;
+        ui.close
+    }) else {
+        return;
+    };
+    // SAFETY: the window belongs to this thread.
+    unsafe {
+        let _ = KillTimer(hwnd, HOVER_TIMER);
+    }
+    close_button::hide(close);
+    update_border(hwnd);
+    update_border(close);
+    invalidate(hwnd);
+}
+
+fn on_hover_timer(hwnd: HWND) {
+    let Some(close) = state::with(|ui| ui.close) else {
+        return;
+    };
+    // SAFETY: both windows belong to this thread.
+    let inside = unsafe {
+        let (mut pt, mut panel, mut button) = (POINT::default(), RECT::default(), RECT::default());
+        GetCursorPos(&mut pt).is_err()
+            || GetWindowRect(hwnd, &mut panel).is_err()
+            || GetWindowRect(close, &mut button).is_err()
+            || super::layout::in_hover_zone(pt, &panel, &button)
+    };
+    if !inside {
+        end_hover(hwnd);
+    }
+}
+
+fn set_opacity(percent: u8) {
+    let Some((panel, close)) = state::with(|ui| {
+        ui.opacity = percent;
+        (ui.panel, ui.close)
+    }) else {
+        return;
+    };
+    let alpha = (percent.min(100) as u32 * 255 / 100) as u8;
+    // SAFETY: both windows are layered and belong to this thread.
+    unsafe {
+        let _ = SetLayeredWindowAttributes(panel, COLORREF(0), alpha, LWA_ALPHA);
+        let _ = SetLayeredWindowAttributes(close, COLORREF(0), alpha, LWA_ALPHA);
+    }
+}
+
+fn toggle_topmost(hwnd: HWND) {
+    let Some(topmost) = state::with(|ui| {
+        ui.topmost = !ui.topmost;
+        ui.topmost
+    }) else {
+        return;
+    };
+    let after = if topmost {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    };
+    // SAFETY: the window belongs to this thread.
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            after,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Hides the panel to the tray, or shows it again.
+fn set_visible(hwnd: HWND, visible: bool) {
+    if visible {
+        // SAFETY: the window belongs to this thread.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    } else {
+        end_hover(hwnd);
+        // SAFETY: as above.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+fn show_menu(hwnd: HWND, pt: POINT) {
+    let Some(menu_state) = state::with(|ui| MenuState {
+        topmost: ui.topmost,
+        opacity: ui.opacity,
+    }) else {
+        return;
+    };
+    match menu::show(hwnd, pt, &menu_state) {
+        Some(Command::ToggleTopmost) => toggle_topmost(hwnd),
+        Some(Command::Opacity(level)) => set_opacity(level),
+        Some(Command::Exit) => {
+            // SAFETY: the window belongs to this thread.
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+        None => {}
+    }
+}
+
+fn on_theme_change(hwnd: HWND) {
+    let theme = theme::system_theme();
+    let Some(close) = state::with(|ui| {
+        ui.theme = theme;
+        ui.close
+    }) else {
+        return;
+    };
+    theme::apply_menu_theme(theme);
+    update_border(hwnd);
+    update_border(close);
+    invalidate(hwnd);
+    invalidate(close);
+}
+
+/// `lparam` of WM_SETTINGCHANGE names the changed area; theme switches send
+/// "ImmersiveColorSet".
+fn is_theme_change(lparam: LPARAM) -> bool {
+    if lparam.0 == 0 {
+        return false;
+    }
+    // SAFETY: for WM_SETTINGCHANGE a non-null lparam is a NUL-terminated wide string.
+    let area = unsafe { PCWSTR(lparam.0 as *const u16).to_string() };
+    area.is_ok_and(|s| s == "ImmersiveColorSet")
+}
+
+fn point_from_lparam(lparam: LPARAM) -> POINT {
+    POINT {
+        x: (lparam.0 & 0xffff) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xffff) as i16 as i32,
+    }
+}
+
+extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    thread_local! {
+        static TASKBAR_CREATED: u32 = tray::taskbar_created_message();
+    }
+
+    // SAFETY: called by the system on the UI thread with valid parameters for `msg`.
+    unsafe {
+        match msg {
+            WM_NCHITTEST => {
+                // Let the user drag the panel from anywhere in the client area.
+                let hit = DefWindowProcW(hwnd, msg, wparam, lparam);
+                if hit.0 as u32 == HTCLIENT {
+                    LRESULT(HTCAPTION as isize)
+                } else {
+                    hit
+                }
+            }
+            // The whole client area reports HTCAPTION, so moves arrive as NC messages.
+            WM_NCMOUSEMOVE => {
+                on_hover(hwnd);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_TIMER if wparam.0 == HOVER_TIMER => {
+                on_hover_timer(hwnd);
+                LRESULT(0)
+            }
+            WM_MOVE => {
+                if let Some((true, close, dpi)) = state::with(|ui| (ui.hovered, ui.close, ui.dpi)) {
+                    close_button::show_beside(close, hwnd, dpi);
+                }
+                LRESULT(0)
+            }
+            // Right-clicks on the HTCAPTION client area arrive as NC messages and do not
+            // reliably produce WM_CONTEXTMENU, so handle the button-up directly.
+            WM_NCRBUTTONUP if wparam.0 as u32 == HTCAPTION => {
+                show_menu(hwnd, point_from_lparam(lparam));
+                LRESULT(0)
+            }
+            WM_CONTEXTMENU => {
+                show_menu(hwnd, point_from_lparam(lparam));
+                LRESULT(0)
+            }
+            WM_APP_TRAY => {
+                match (lparam.0 & 0xffff) as u32 {
+                    WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd, POINT { x: -1, y: -1 }),
+                    WM_LBUTTONDBLCLK => set_visible(hwnd, !IsWindowVisible(hwnd).as_bool()),
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_APP_HIDE_PANEL => {
+                set_visible(hwnd, false);
+                LRESULT(0)
+            }
+            WM_SETTINGCHANGE => {
+                if is_theme_change(lparam) {
+                    on_theme_change(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_ERASEBKGND => LRESULT(1),
+            WM_PAINT => {
+                on_paint(hwnd);
+                LRESULT(0)
+            }
+            WM_DPICHANGED => {
+                let dpi = (wparam.0 & 0xffff) as u32;
+                state::with(|ui| {
+                    ui.dpi = dpi;
+                    ui.fonts = Fonts::new(dpi);
+                });
+                // lparam points to the suggested new window rect; keep its origin
+                // and use the exact layout size for the new DPI.
+                let r = &*(lparam.0 as *const RECT);
+                let (w, h) = panel_size(dpi);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    r.left,
+                    r.top,
+                    w,
+                    h,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                invalidate(hwnd);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                let _ = KillTimer(hwnd, HOVER_TIMER);
+                tray::remove(hwnd);
+                state::clear();
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
+            _ if msg != 0 && msg == TASKBAR_CREATED.with(|m| *m) => {
+                tray::add(hwnd, IDI_APP);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
