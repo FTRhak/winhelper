@@ -88,7 +88,7 @@ Behavior:
 ```
 
 - **UI thread** owns the window and only paints. It never blocks on I/O.
-- **Metrics thread** samples every 1 s, writes a `MetricsSnapshot` into shared state, then posts `WM_APP_METRICS`, which leads to `InvalidateRect`.
+- **Metrics thread** samples every 1 s while the panel is focused or hovered and every 10 s otherwise (the first sample always comes after 1 s). It writes a `MetricsSnapshot` into shared state, then posts `WM_APP_METRICS`, which leads to `InvalidateRect`. The UI flips the rate via `Sampler::set_active`; becoming active wakes the thread so it samples at once if the last sample is ≥ 1 s old. Samples are never closer than 1 s, so CPU/GPU deltas stay meaningful.
 - **Network thread** waits on a channel or event (startup, timer, network change callback, or "Refresh" menu command), performs the HTTP lookup with a timeout, and posts `WM_APP_NETINFO`.
 - Shutdown: a shared `AtomicBool` stop flag plus an event to wake the workers. The threads are joined in `WM_DESTROY`.
 
@@ -157,9 +157,9 @@ Windows exposes GPU load via PDH (WDDM 2.0+, Windows 10 1709+):
 4. `PdhGetFormattedCounterArrayW(PDH_FMT_DOUBLE)` → instances named like
    `pid_1234_luid_0x..._phys_0_eng_3_engtype_3D`.
 5. Aggregate as Task Manager does:
-   - group by `luid` (adapter) and `engtype`, **summing** across processes;
-   - per adapter, take the **max** over engine types (3D, Compute, VideoDecode, Copy, …);
-   - show the busiest adapter (or the discrete one when there is a hybrid iGPU + dGPU).
+   - group by engine (`luid` + `phys` + `eng` index), **summing** across processes. Grouping by `engtype` instead would merge, and so overcount, two engines of the same type (e.g. two Copy engines);
+   - per adapter, take the **max** over its engines (3D, Compute, VideoDecode, Copy, …);
+   - show the busiest adapter. Preferring the discrete adapter on hybrid iGPU + dGPU systems is not implemented.
 6. Clamp to 0–100 %.
 
 Optional extra: VRAM usage via `\GPU Adapter Memory(*)\Dedicated Usage`, with the adapter total from DXGI `IDXGIAdapter3::QueryVideoMemoryInfo`. Adapter names come from DXGI (`EnumAdapters1` → `DXGI_ADAPTER_DESC1`, matched by LUID).
@@ -168,8 +168,8 @@ If the counters are unavailable (old driver, RDP session, VM), show `GPU  N/A` i
 
 ### 5.4 Local IP
 
-- `GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER)`.
-- Choose the adapter with `OperStatus == IfOperStatusUp`, a default gateway, and the lowest route metric. Prefer IPv4, and show IPv6 in the tooltip.
+- `GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_GATEWAYS)`.
+- Choose the adapter with `OperStatus == IfOperStatusUp`, not loopback, preferring one with a default gateway, then the lowest `Ipv4Metric`. APIPA (169.254/16) addresses are skipped. IPv4 only for now; showing IPv6 in the tooltip needs an `AF_UNSPEC` query.
 - `NotifyIpInterfaceChange` notifies the network thread on Wi-Fi switch, VPN connect, and similar events. Debounce for about 2 s before refreshing.
 
 ### 5.5 Public IP and location
@@ -178,12 +178,15 @@ A single HTTPS request returns both the IP and the location:
 
 | Provider | Endpoint | Notes |
 |---|---|---|
-| **Primary**: ipinfo.io | `https://ipinfo.io/json` | `ip`, `city`, `region`, `country`, `org`; free tier without a token, rate limited |
-| **Fallback**: ipwho.is | `https://ipwho.is/` | `ip`, `city`, `country`, `country_code`, `connection.isp` |
+| **Primary**: ipwho.is | `https://ipwho.is/` | `ip`, `city`, `country`, `country_code`, `connection.isp`; `success: false` on errors |
+| **Fallback**: ipinfo.io | `https://ipinfo.io/json` | `ip`, `city`, `region`, `country`, `org`; free tier without a token, rate limited. `country` is only the code, so the location shows just the city |
 | IP-only fallback | `https://api.ipify.org` | Used when both geo providers fail, so at least the IP is shown |
 
-- Refresh triggers: app start, every 10 minutes, a network change event, or the manual "Refresh IP" command.
-- Timeouts: 5 s connect and 5 s receive (`WinHttpSetTimeouts`).
+ipwho.is is primary because it returns the country name, which the "City, Country" row needs; ipinfo.io returns only the code.
+
+- Refresh triggers: app start, every 10 minutes, a network change event, or the manual "Refresh IP" command. Implemented so far: app start and the manual command.
+- Timeouts: 5 s each for resolve, connect, send and receive (`WinHttpSetTimeouts`). The system proxy is used (`WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY`).
+- Shutdown does not wait for a lookup that is mid-request; the thread is detached and ends with the process.
 - On failure, keep the last known values, gray them out, and show the error in the tooltip.
 - Make the provider list configurable in settings.
 - **Privacy**: the request reveals the user's IP to the third-party provider. State this in the README and add a setting to disable the public IP and location lookup.
@@ -253,7 +256,7 @@ Targets: `x86_64-pc-windows-msvc` (primary) and `aarch64-pc-windows-msvc` (optio
 | # | Milestone | Deliverable |
 |---|---|---|
 | M0 | Project skeleton | `cargo new`, `windows` crate, manifest/icon embedding, empty borderless draggable window, single instance |
-| M1 | CPU and RAM | Metrics thread, snapshot posting, GDI bars and text, 1 s refresh |
+| M1 | CPU and RAM | Metrics thread, snapshot posting, GDI bars and text, 1 s refresh when active / 10 s otherwise |
 | M2 | GPU | PDH wildcard query, per-adapter aggregation, N/A fallback; verified against Task Manager |
 | M3 | Network | WinHTTP wrapper, provider and fallback chain, local IP, change notifications, manual refresh |
 | M4 | Shell integration | Tray icon, context menu, always-on-top, opacity, copy IP, autostart, settings persistence |
@@ -284,7 +287,7 @@ Targets: `x86_64-pc-windows-msvc` (primary) and `aarch64-pc-windows-msvc` (optio
 | Risk | Mitigation |
 |---|---|
 | GPU PDH counters missing (old WDDM, VM, RDP) | Detect at startup and show `N/A`; never crash |
-| GPU numbers differ from Task Manager | Use the same aggregation (sum per engine type, max across engines); document it |
+| GPU numbers differ from Task Manager | Use the same aggregation (sum per engine, max across engines); document it |
 | Geo provider rate limits or outages | Fallback chain, 10 min cache, manual refresh only on demand |
 | VPN or proxy affects the result | This is expected (it shows the egress IP); WinHTTP respects the system proxy via `WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY` |
 | Antivirus false positives on a small unsigned exe | Optional code signing; avoid packers such as UPX |

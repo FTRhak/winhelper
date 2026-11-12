@@ -1,24 +1,11 @@
 //! What the panel shows, decoupled from where it comes from.
 //!
-//! The metrics (M1/M2) and network (M3) threads will fill this in; until then
-//! every field is `None` and the panel renders its "unavailable" state.
+//! The metrics thread fills CPU / RAM / GPU (`window::on_metrics`); the network
+//! thread fills `net` (`window::on_netinfo`). Until data arrives every field is
+//! `None` and the panel renders its "unavailable" state.
 
-/// Physical memory in bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Memory {
-    pub used: u64,
-    pub total: u64,
-}
-
-impl Memory {
-    pub fn percent(self) -> f32 {
-        if self.total == 0 {
-            0.0
-        } else {
-            self.used as f32 * 100.0 / self.total as f32
-        }
-    }
-}
+pub use crate::metrics::Memory;
+use crate::net::NetInfo;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NetView {
@@ -30,6 +17,26 @@ pub struct NetView {
     pub country_code: Option<String>,
     /// Last refresh failed; values are from an earlier successful lookup.
     pub stale: bool,
+}
+
+impl NetView {
+    /// Applies a finished lookup. The LAN IP is always current. When every
+    /// public provider failed, the last public values stay, grayed out (`stale`).
+    pub fn update(&mut self, info: NetInfo) {
+        self.lan_ip = info.lan_ip;
+        let Some(geo) = info.public else {
+            self.stale = true;
+            return;
+        };
+        // An IP-only answer for the same IP keeps the location already known.
+        let keep_location = geo.location.is_none() && self.public_ip.as_ref() == Some(&geo.ip);
+        if !keep_location {
+            self.location = geo.location;
+            self.country_code = geo.country_code;
+        }
+        self.public_ip = Some(geo.ip);
+        self.stale = false;
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -93,8 +100,67 @@ mod tests {
         assert_eq!(round_percent(mem.percent()), 63);
     }
 
+    fn info(lan: Option<&str>, public: Option<(&str, Option<&str>, Option<&str>)>) -> NetInfo {
+        NetInfo {
+            lan_ip: lan.map(Into::into),
+            public: public.map(|(ip, loc, code)| crate::net::Geo {
+                ip: ip.into(),
+                location: loc.map(Into::into),
+                country_code: code.map(Into::into),
+            }),
+        }
+    }
+
     #[test]
-    fn zero_total_memory_is_zero_percent() {
-        assert_eq!(Memory { used: 5, total: 0 }.percent(), 0.0);
+    fn net_update_success_then_failure() {
+        let mut net = NetView::default();
+        net.update(info(
+            Some("192.168.1.15"),
+            Some(("203.0.113.42", Some("Kyiv, Ukraine"), Some("UA"))),
+        ));
+        let fresh = NetView {
+            public_ip: Some("203.0.113.42".into()),
+            lan_ip: Some("192.168.1.15".into()),
+            location: Some("Kyiv, Ukraine".into()),
+            country_code: Some("UA".into()),
+            stale: false,
+        };
+        assert_eq!(net, fresh);
+
+        // Offline: public values kept but stale; LAN follows the adapter.
+        net.update(info(None, None));
+        assert_eq!(
+            net,
+            NetView {
+                lan_ip: None,
+                stale: true,
+                ..fresh.clone()
+            }
+        );
+
+        // Back online: stale cleared.
+        net.update(info(
+            Some("192.168.1.15"),
+            Some(("203.0.113.42", Some("Kyiv, Ukraine"), Some("UA"))),
+        ));
+        assert_eq!(net, fresh);
+    }
+
+    #[test]
+    fn net_update_ip_only_answer() {
+        let mut net = NetView::default();
+        net.update(info(
+            None,
+            Some(("203.0.113.42", Some("Kyiv, Ukraine"), Some("UA"))),
+        ));
+        // Same IP without location: keep the known location.
+        net.update(info(None, Some(("203.0.113.42", None, None))));
+        assert_eq!(net.location.as_deref(), Some("Kyiv, Ukraine"));
+        assert_eq!(net.country_code.as_deref(), Some("UA"));
+        // New IP without location: the old location no longer applies.
+        net.update(info(None, Some(("198.51.100.7", None, None))));
+        assert_eq!(net.public_ip.as_deref(), Some("198.51.100.7"));
+        assert_eq!(net.location, None);
+        assert_eq!(net.country_code, None);
     }
 }

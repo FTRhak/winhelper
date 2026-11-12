@@ -26,12 +26,15 @@ const CMD_OPACITY_BASE: u32 = 100;
 pub struct MenuState {
     pub topmost: bool,
     pub opacity: u8,
+    /// The network lookup is running (it is not in demo mode).
+    pub can_refresh_ip: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     ToggleTopmost,
     Opacity(u8),
+    RefreshIp,
     Exit,
 }
 
@@ -108,8 +111,13 @@ fn build(state: &MenuState) -> Option<Menu> {
     menu.submenu(opacity, w!("Opacity"));
 
     menu.separator();
-    // Network actions arrive with M3, autostart with M4.
-    menu.item(CMD_REFRESH_IP, w!("Refresh IP now"), MF_GRAYED);
+    let refresh = if state.can_refresh_ip {
+        MENU_ITEM_FLAGS(0)
+    } else {
+        MF_GRAYED
+    };
+    menu.item(CMD_REFRESH_IP, w!("Refresh IP now"), refresh);
+    // Copy IP is still to come in M3, autostart in M4.
     menu.item(CMD_COPY_IP, w!("Copy IP to clipboard"), MF_GRAYED);
     menu.separator();
     menu.item(CMD_AUTOSTART, w!("Start with Windows"), MF_GRAYED);
@@ -121,6 +129,7 @@ fn build(state: &MenuState) -> Option<Menu> {
 fn command(id: u32) -> Option<Command> {
     match id {
         CMD_TOPMOST => Some(Command::ToggleTopmost),
+        CMD_REFRESH_IP => Some(Command::RefreshIp),
         CMD_EXIT => Some(Command::Exit),
         _ => {
             let index = id.checked_sub(CMD_OPACITY_BASE)? as usize;
@@ -164,6 +173,7 @@ mod tests {
     fn maps_ids_to_commands() {
         assert_eq!(command(CMD_TOPMOST), Some(Command::ToggleTopmost));
         assert_eq!(command(CMD_EXIT), Some(Command::Exit));
+        assert_eq!(command(CMD_REFRESH_IP), Some(Command::RefreshIp));
         assert_eq!(command(CMD_OPACITY_BASE), Some(Command::Opacity(100)));
         assert_eq!(command(CMD_OPACITY_BASE + 2), Some(Command::Opacity(70)));
         assert_eq!(command(CMD_OPACITY_BASE + 3), None);

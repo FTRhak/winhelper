@@ -11,6 +11,8 @@ use windows::Win32::Foundation::HWND;
 use super::paint::Fonts;
 use super::theme::Theme;
 use super::view::PanelView;
+use crate::metrics::Sampler;
+use crate::net::Lookup;
 
 pub struct Ui {
     pub panel: HWND,
@@ -23,6 +25,12 @@ pub struct Ui {
     pub hovered: bool,
     /// Cursor is over the close button itself.
     pub close_hovered: bool,
+    /// The panel is the active (foreground) window.
+    pub focused: bool,
+    /// CPU / RAM / GPU sampler thread; `None` in demo mode or if it failed to start.
+    pub sampler: Option<Sampler>,
+    /// Public / LAN IP lookup thread; `None` in demo mode or if it failed to start.
+    pub net: Option<Lookup>,
     pub topmost: bool,
     /// Window opacity in percent.
     pub opacity: u8,

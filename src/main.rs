@@ -4,6 +4,8 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod metrics;
+mod net;
 mod ui;
 mod win;
 

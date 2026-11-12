@@ -17,10 +17,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage, CS_DBLCLKS, CS_DROPSHADOW,
     HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, LWA_ALPHA, MSG, SPI_GETWORKAREA,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOWNOACTIVATE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_LBUTTONDBLCLK, WM_MOVE, WM_NCHITTEST, WM_NCMOUSEMOVE, WM_NCRBUTTONUP, WM_PAINT,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WA_INACTIVE, WM_ACTIVATE, WM_CONTEXTMENU, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_MOVE, WM_NCHITTEST, WM_NCMOUSEMOVE,
+    WM_NCRBUTTONUP, WM_PAINT, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use super::close_button::{self, WM_APP_HIDE_PANEL};
@@ -33,6 +33,8 @@ use super::state::{self, Ui};
 use super::theme;
 use super::tray::{self, WM_APP_TRAY};
 use super::view::PanelView;
+use crate::metrics::{Sampler, WM_APP_METRICS};
+use crate::net::{Lookup, WM_APP_NETINFO};
 
 const CLASS_NAME: PCWSTR = w!("WinHelper.Panel");
 const WINDOW_TITLE: PCWSTR = w!("WinHelper");
@@ -100,15 +102,27 @@ pub fn create() -> Result<HWND> {
 
         let dpi = GetDpiForWindow(hwnd);
         let theme = theme::system_theme();
+        // Demo data stays fixed, so no worker thread overwrites it.
+        let (view, sampler, net) = match demo_view() {
+            Some(view) => (view, None, None),
+            None => (
+                PanelView::default(),
+                Sampler::start(hwnd),
+                Lookup::start(hwnd),
+            ),
+        };
         state::init(Ui {
             panel: hwnd,
             close,
             dpi,
             theme,
             fonts: Fonts::new(dpi),
-            view: initial_view(),
+            view,
             hovered: false,
             close_hovered: false,
+            focused: false,
+            sampler,
+            net,
             topmost: true,
             opacity: 100,
         });
@@ -138,12 +152,51 @@ pub fn run_message_loop() {
     }
 }
 
-fn initial_view() -> PanelView {
+fn demo_view() -> Option<PanelView> {
     #[cfg(debug_assertions)]
-    if let Some(view) = super::demo::view() {
-        return view;
+    return super::demo::view();
+    #[cfg(not(debug_assertions))]
+    None
+}
+
+/// Samples every second while the panel is focused or hovered, every ten
+/// seconds otherwise. Safe to call inside `state::with` (no window calls).
+fn update_sampling(ui: &Ui) {
+    if let Some(sampler) = &ui.sampler {
+        sampler.set_active(ui.focused || ui.hovered);
     }
-    PanelView::default()
+}
+
+/// WM_APP_METRICS: copy the newest snapshot into the view and repaint.
+fn on_metrics(hwnd: HWND) {
+    let changed = state::with(|ui| {
+        let Some(snap) = ui.sampler.as_ref().and_then(Sampler::take_latest) else {
+            return false;
+        };
+        let before = (ui.view.cpu, ui.view.ram, ui.view.gpu);
+        ui.view.cpu = snap.cpu;
+        ui.view.ram = snap.ram;
+        ui.view.gpu = snap.gpu;
+        before != (snap.cpu, snap.ram, snap.gpu)
+    });
+    if changed == Some(true) {
+        invalidate(hwnd);
+    }
+}
+
+/// WM_APP_NETINFO: merge the finished lookup into the view and repaint.
+fn on_netinfo(hwnd: HWND) {
+    let changed = state::with(|ui| {
+        let Some(info) = ui.net.as_ref().and_then(Lookup::take_latest) else {
+            return false;
+        };
+        let before = ui.view.net.clone();
+        ui.view.net.update(info);
+        before != ui.view.net
+    });
+    if changed == Some(true) {
+        invalidate(hwnd);
+    }
 }
 
 /// Requests Windows 11 rounded corners (8 px, or 4 px when `small`). No-op on Windows 10.
@@ -257,6 +310,7 @@ fn on_hover(hwnd: HWND) {
     let Some((close, dpi)) = state::with(|ui| {
         (!ui.hovered).then(|| {
             ui.hovered = true;
+            update_sampling(ui);
             (ui.close, ui.dpi)
         })
     })
@@ -275,6 +329,7 @@ fn on_hover(hwnd: HWND) {
 fn end_hover(hwnd: HWND) {
     let Some(close) = state::with(|ui| {
         ui.hovered = false;
+        update_sampling(ui);
         ui.close
     }) else {
         return;
@@ -367,12 +422,16 @@ fn show_menu(hwnd: HWND, pt: POINT) {
     let Some(menu_state) = state::with(|ui| MenuState {
         topmost: ui.topmost,
         opacity: ui.opacity,
+        can_refresh_ip: ui.net.is_some(),
     }) else {
         return;
     };
     match menu::show(hwnd, pt, &menu_state) {
         Some(Command::ToggleTopmost) => toggle_topmost(hwnd),
         Some(Command::Opacity(level)) => set_opacity(level),
+        Some(Command::RefreshIp) => {
+            state::with(|ui| ui.net.as_ref().map(Lookup::refresh));
+        }
         Some(Command::Exit) => {
             // SAFETY: the window belongs to this thread.
             unsafe {
@@ -470,6 +529,22 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 set_visible(hwnd, false);
                 LRESULT(0)
             }
+            WM_APP_METRICS => {
+                on_metrics(hwnd);
+                LRESULT(0)
+            }
+            WM_APP_NETINFO => {
+                on_netinfo(hwnd);
+                LRESULT(0)
+            }
+            WM_ACTIVATE => {
+                let focused = (wparam.0 & 0xffff) as u32 != WA_INACTIVE;
+                state::with(|ui| {
+                    ui.focused = focused;
+                    update_sampling(ui);
+                });
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_SETTINGCHANGE => {
                 if is_theme_change(lparam) {
                     on_theme_change(hwnd);
@@ -506,6 +581,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             WM_DESTROY => {
                 let _ = KillTimer(hwnd, HOVER_TIMER);
                 tray::remove(hwnd);
+                // Stop the worker threads (outside the state borrow).
+                drop(state::with(|ui| (ui.sampler.take(), ui.net.take())));
                 state::clear();
                 PostQuitMessage(0);
                 LRESULT(0)
