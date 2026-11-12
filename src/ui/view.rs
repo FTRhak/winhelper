@@ -1,10 +1,11 @@
-//! What the panel shows, decoupled from where it comes from.
+//! What the strip and its tooltip show, decoupled from where it comes from.
 //!
-//! The metrics thread fills CPU / RAM / GPU (`window::on_metrics`); the network
-//! thread fills `net` (`window::on_netinfo`). Until data arrives every field is
-//! `None` and the panel renders its "unavailable" state.
+//! The metrics thread fills CPU / RAM / GPU, throughput and connectivity
+//! (`window::on_metrics`); the network thread fills `net`
+//! (`window::on_netinfo`). Until data arrives every field is `None` and the
+//! UI renders its "unavailable" state.
 
-pub use crate::metrics::Memory;
+pub use crate::metrics::{Memory, Traffic};
 use crate::net::NetInfo;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -17,6 +18,8 @@ pub struct NetView {
     pub country_code: Option<String>,
     /// Last refresh failed; values are from an earlier successful lookup.
     pub stale: bool,
+    /// Local time of the last successful public lookup, "14:02".
+    pub updated: Option<String>,
 }
 
 impl NetView {
@@ -36,6 +39,7 @@ impl NetView {
         }
         self.public_ip = Some(geo.ip);
         self.stale = false;
+        self.updated = info.at;
     }
 }
 
@@ -45,7 +49,32 @@ pub struct PanelView {
     pub ram: Option<Memory>,
     /// `None` when GPU counters are unavailable.
     pub gpu: Option<f32>,
+    /// Download / upload rate; `None` until the first sample.
+    pub traffic: Option<Traffic>,
+    /// Internet access as Windows reports it; `None` when unknown.
+    pub online: Option<bool>,
     pub net: NetView,
+}
+
+/// Internet status shown by the globe and the tooltip header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Online,
+    Offline,
+    Unknown,
+}
+
+impl PanelView {
+    /// Windows' connectivity when known, else the outcome of the last IP lookup.
+    pub fn status(&self) -> Status {
+        match self.online {
+            Some(true) => Status::Online,
+            Some(false) => Status::Offline,
+            None if self.net.stale => Status::Offline,
+            None if self.net.public_ip.is_some() => Status::Online,
+            None => Status::Unknown,
+        }
+    }
 }
 
 /// Rounds a load percentage for display and color classification.
@@ -57,10 +86,18 @@ pub fn round_percent(value: f32) -> u32 {
     }
 }
 
-/// "42 %", or "N/A" when the metric is unavailable.
+/// Tooltip form: "42 %", or "N/A" when the metric is unavailable.
 pub fn percent_text(value: Option<f32>) -> String {
     match value {
         Some(v) => format!("{} %", round_percent(v)),
+        None => "N/A".to_owned(),
+    }
+}
+
+/// Strip form: "42%", or "N/A".
+pub fn compact_percent(value: Option<f32>) -> String {
+    match value {
+        Some(v) => format!("{}%", round_percent(v)),
         None => "N/A".to_owned(),
     }
 }
@@ -73,6 +110,47 @@ pub fn memory_text(mem: Memory) -> String {
         mem.used as f64 / GIB,
         mem.total as f64 / GIB
     )
+}
+
+/// A byte rate split into number and unit, at most 4 + 4 characters so the
+/// strip slots never overflow: ("1.2", "MB/s"), ("84", "KB/s"), ("0", "B/s").
+/// Binary units (1 KB = 1024 B), one decimal below 10.
+pub fn rate_parts(bytes_per_sec: f64) -> (String, &'static str) {
+    const UNITS: [&str; 4] = ["B/s", "KB/s", "MB/s", "GB/s"];
+    let mut v = if bytes_per_sec.is_finite() {
+        bytes_per_sec.max(0.0)
+    } else {
+        0.0
+    };
+    let mut unit = 0;
+    // 999.5 would round to "1000", one character too many.
+    while v >= 999.5 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    let number = if unit > 0 && v < 9.95 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.0}")
+    };
+    (number, UNITS[unit])
+}
+
+/// "1.2 MB/s".
+pub fn rate_text(bytes_per_sec: f64) -> String {
+    let (number, unit) = rate_parts(bytes_per_sec);
+    format!("{number} {unit}")
+}
+
+/// Tooltip footer line.
+pub fn footer_text(net: &NetView) -> String {
+    match (&net.updated, net.stale) {
+        (Some(at), false) => format!("IP updated {at} · right-click for menu"),
+        (Some(at), true) => format!("IP lookup failed · last update {at}"),
+        (None, true) => "IP lookup failed".to_owned(),
+        (None, false) if net.public_ip.is_none() => "Looking up IP…".to_owned(),
+        (None, false) => "Right-click for menu".to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +166,9 @@ mod tests {
         assert_eq!(percent_text(Some(100.4)), "100 %");
         assert_eq!(percent_text(None), "N/A");
         assert_eq!(round_percent(f32::NAN), 0);
+        assert_eq!(compact_percent(Some(7.2)), "7%");
+        assert_eq!(compact_percent(Some(100.0)), "100%");
+        assert_eq!(compact_percent(None), "N/A");
     }
 
     #[test]
@@ -100,6 +181,56 @@ mod tests {
         assert_eq!(round_percent(mem.percent()), 63);
     }
 
+    #[test]
+    fn rate_scales_units_and_fits_slots() {
+        let parts = |v: f64| {
+            let (n, u) = rate_parts(v);
+            (n, u.to_owned())
+        };
+        assert_eq!(parts(0.0), ("0".into(), "B/s".into()));
+        assert_eq!(parts(999.0), ("999".into(), "B/s".into()));
+        assert_eq!(parts(999.6), ("1.0".into(), "KB/s".into()));
+        assert_eq!(parts(84.0 * 1024.0), ("84".into(), "KB/s".into()));
+        assert_eq!(parts(1.2 * 1024.0 * 1024.0), ("1.2".into(), "MB/s".into()));
+        assert_eq!(parts(24.8 * 1024.0 * 1024.0), ("25".into(), "MB/s".into()));
+        assert_eq!(parts(9.96 * 1024.0), ("10".into(), "KB/s".into()));
+        assert_eq!(parts(-5.0), ("0".into(), "B/s".into()));
+        assert_eq!(parts(f64::NAN), ("0".into(), "B/s".into()));
+        assert_eq!(parts(1e15).1, "GB/s");
+        for v in [0.0, 999.4, 1023.0 * 1024.0, 5e9, 1e12] {
+            let (n, u) = rate_parts(v);
+            assert!(n.len() <= 4 && u.len() <= 4, "{v}: {n} {u}");
+        }
+        assert_eq!(rate_text(84.0 * 1024.0), "84 KB/s");
+    }
+
+    #[test]
+    fn status_prefers_windows_then_lookup() {
+        let mut v = PanelView::default();
+        assert_eq!(v.status(), Status::Unknown);
+        v.net.public_ip = Some("203.0.113.42".into());
+        assert_eq!(v.status(), Status::Online);
+        v.net.stale = true;
+        assert_eq!(v.status(), Status::Offline);
+        v.online = Some(true);
+        assert_eq!(v.status(), Status::Online);
+        v.online = Some(false);
+        assert_eq!(v.status(), Status::Offline);
+    }
+
+    #[test]
+    fn footer_follows_lookup_state() {
+        let mut net = NetView::default();
+        assert_eq!(footer_text(&net), "Looking up IP…");
+        net.public_ip = Some("203.0.113.42".into());
+        net.updated = Some("14:02".into());
+        assert_eq!(footer_text(&net), "IP updated 14:02 · right-click for menu");
+        net.stale = true;
+        assert_eq!(footer_text(&net), "IP lookup failed · last update 14:02");
+        net.updated = None;
+        assert_eq!(footer_text(&net), "IP lookup failed");
+    }
+
     fn info(lan: Option<&str>, public: Option<(&str, Option<&str>, Option<&str>)>) -> NetInfo {
         NetInfo {
             lan_ip: lan.map(Into::into),
@@ -108,6 +239,7 @@ mod tests {
                 location: loc.map(Into::into),
                 country_code: code.map(Into::into),
             }),
+            at: Some("14:02".into()),
         }
     }
 
@@ -124,11 +256,14 @@ mod tests {
             location: Some("Kyiv, Ukraine".into()),
             country_code: Some("UA".into()),
             stale: false,
+            updated: Some("14:02".into()),
         };
         assert_eq!(net, fresh);
 
-        // Offline: public values kept but stale; LAN follows the adapter.
-        net.update(info(None, None));
+        // Offline: public values and their time kept but stale; LAN follows the adapter.
+        let mut failed = info(None, None);
+        failed.at = Some("14:12".into());
+        net.update(failed);
         assert_eq!(
             net,
             NetView {

@@ -1,4 +1,5 @@
-//! Light / dark palettes (design/WinHelper.bl, "Palette — Dark/Light"), load
+//! Light / dark palettes (design/WinHelper.bl, "Palette — Dark/Light" and
+//! "WinHelper · Minimal"), load
 //! thresholds and system theme detection.
 
 use windows::core::{s, w, PCSTR};
@@ -41,7 +42,14 @@ pub struct Palette {
     pub high: COLORREF,
     /// Percentage text above the high threshold.
     pub high_value: COLORREF,
+    /// Percentage text from 60 to 85 %.
+    pub elevated_value: COLORREF,
+    /// Country code text and the upload arrow.
     pub country: COLORREF,
+    /// Country code tag background.
+    pub tag_bg: COLORREF,
+    pub tip_bg: COLORREF,
+    pub tip_border: COLORREF,
     pub close_bg: COLORREF,
     pub close_border: COLORREF,
     pub close_glyph: COLORREF,
@@ -64,7 +72,11 @@ pub const DARK: Palette = Palette {
     elevated: hex(0xE3A21A),
     high: hex(0xF85149),
     high_value: hex(0xFF7B72),
+    elevated_value: hex(0xE3A21A),
     country: hex(0x8CB4FF),
+    tag_bg: hex(0x2F3A4A),
+    tip_bg: hex(0x2B2B2B),
+    tip_border: hex(0x454545),
     close_bg: hex(0x202020),
     close_border: hex(0x3A3A3A),
     close_glyph: hex(0xC8C8C8),
@@ -87,7 +99,11 @@ pub const LIGHT: Palette = Palette {
     elevated: hex(0xD18E00),
     high: hex(0xCF222E),
     high_value: hex(0xCF222E),
+    elevated_value: hex(0xB7791F),
     country: hex(0x1F5BD6),
+    tag_bg: hex(0xDDEBFF),
+    tip_bg: hex(0xFFFFFF),
+    tip_border: hex(0xD6D6D6),
     close_bg: hex(0xF9F9F9),
     close_border: hex(0xC4C4C4),
     close_glyph: hex(0x444444),
@@ -132,10 +148,12 @@ impl Load {
         }
     }
 
+    /// Value text: neutral when normal, amber when elevated, red when high.
     pub fn text_color(self, p: &Palette) -> COLORREF {
         match self {
+            Load::Normal => p.value,
+            Load::Elevated => p.elevated_value,
             Load::High => p.high_value,
-            _ => p.value,
         }
     }
 }
@@ -227,9 +245,10 @@ mod tests {
     }
 
     #[test]
-    fn high_load_uses_highlighted_text_only_in_high() {
+    fn value_text_follows_load() {
         let p = &DARK;
-        assert_eq!(Load::Elevated.text_color(p), p.value);
+        assert_eq!(Load::Normal.text_color(p), p.value);
+        assert_eq!(Load::Elevated.text_color(p), p.elevated_value);
         assert_eq!(Load::High.text_color(p), p.high_value);
         assert_eq!(Load::High.bar_color(&LIGHT), LIGHT.high);
     }

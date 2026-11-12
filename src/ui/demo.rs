@@ -1,13 +1,16 @@
-//! Debug-only sample data reproducing the states in design/WinHelper.bl, so the
-//! visual design can be checked before real data sources exist.
+//! Debug-only sample data reproducing the states in design/WinHelper.bl
+//! ("WinHelper · Minimal"), so the visual design can be checked without real load.
 //!
-//! `WINHELPER_DEMO=normal|high|offline` fills the panel; `WINHELPER_THEME=dark|light`
-//! overrides the system theme. Neither exists in release builds.
+//! `WINHELPER_DEMO=normal|high|offline` fills the strip and tooltip;
+//! `WINHELPER_THEME=dark|light` overrides the system theme. Neither exists in
+//! release builds.
 
 use super::theme::Theme;
-use super::view::{Memory, NetView, PanelView};
+use super::view::{Memory, NetView, PanelView, Traffic};
 
 const GIB: u64 = 1 << 30;
+const KIB: f64 = 1024.0;
+const MIB: f64 = 1024.0 * 1024.0;
 
 pub fn theme_override() -> Option<Theme> {
     match std::env::var("WINHELPER_THEME").ok()?.as_str() {
@@ -29,18 +32,26 @@ pub fn view() -> Option<PanelView> {
         location: Some("Kyiv, Ukraine".into()),
         country_code: Some("UA".into()),
         stale: false,
+        updated: Some("14:02".into()),
     };
     Some(match kind.as_str() {
         "high" => PanelView {
             cpu: Some(91.0),
             ram: Some(mem(125)),
             gpu: None,
+            traffic: Some(Traffic {
+                down: 24.8 * MIB,
+                up: 1.6 * MIB,
+            }),
+            online: Some(true),
             net,
         },
         "offline" => PanelView {
             cpu: Some(7.0),
             ram: Some(mem(66)),
             gpu: Some(3.0),
+            traffic: Some(Traffic::default()),
+            online: Some(false),
             net: NetView {
                 lan_ip: None,
                 stale: true,
@@ -51,6 +62,11 @@ pub fn view() -> Option<PanelView> {
             cpu: Some(42.0),
             ram: Some(mem(101)),
             gpu: Some(18.0),
+            traffic: Some(Traffic {
+                down: 1.2 * MIB,
+                up: 84.0 * KIB,
+            }),
+            online: Some(true),
             net,
         },
     })

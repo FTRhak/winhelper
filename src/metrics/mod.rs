@@ -1,13 +1,16 @@
-//! System load sampling on a background thread (PLAN.md §4, §5.1–5.3).
+//! System load sampling on a background thread (PLAN.md §4, §5.1–5.3, §5.6).
 //!
-//! The sampler reads CPU, RAM and GPU load, stores the latest `MetricsSnapshot`
+//! The sampler reads CPU, RAM and GPU load, network throughput and internet
+//! connectivity, stores the latest `MetricsSnapshot`
 //! in shared state and posts `WM_APP_METRICS` to the panel. It samples every
 //! `FAST_INTERVAL` while the panel is active (focused or hovered) and every
 //! `SLOW_INTERVAL` otherwise.
 
+mod connectivity;
 mod cpu;
 mod gpu;
 mod memory;
+mod traffic;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::win::Event;
 pub use memory::Memory;
+pub use traffic::Traffic;
 
 /// Posted to the panel when a new snapshot is ready; fetch it with `Sampler::take_latest`.
 pub const WM_APP_METRICS: u32 = WM_APP + 3;
@@ -34,6 +38,10 @@ pub struct MetricsSnapshot {
     pub cpu: Option<f32>,
     pub ram: Option<Memory>,
     pub gpu: Option<f32>,
+    /// Throughput averaged since the previous sample.
+    pub traffic: Option<Traffic>,
+    /// Internet access per Windows; `None` when unknown.
+    pub online: Option<bool>,
 }
 
 struct Shared {
@@ -107,6 +115,8 @@ fn remaining(last: Instant, now: Instant, interval: Duration) -> Option<Duration
 fn run(shared: &Shared, panel: isize) {
     let mut cpu = cpu::CpuSampler::new();
     let mut gpu = gpu::GpuSampler::open();
+    let mut traffic = traffic::TrafficSampler::new();
+    let connectivity = connectivity::Connectivity::new();
     let mut last = Instant::now();
     // The first sample comes after FAST_INTERVAL even when inactive, so the panel
     // does not show N/A for a whole slow period after startup.
@@ -131,6 +141,8 @@ fn run(shared: &Shared, panel: isize) {
             cpu: cpu.sample(),
             ram: memory::read(),
             gpu: gpu.as_mut().and_then(gpu::GpuSampler::sample),
+            traffic: traffic.sample(),
+            online: connectivity.online(),
         };
         if let Ok(mut latest) = shared.latest.lock() {
             *latest = Some(snapshot);
@@ -167,12 +179,16 @@ mod live {
     fn samples_real_counters() {
         let mut cpu = super::cpu::CpuSampler::new();
         let mut gpu = super::gpu::GpuSampler::open();
+        let mut traffic = super::traffic::TrafficSampler::new();
         std::thread::sleep(super::FAST_INTERVAL);
         let cpu = cpu.sample();
         let ram = super::memory::read();
         let gpu = gpu.as_mut().and_then(super::gpu::GpuSampler::sample);
-        println!("cpu {cpu:?}  ram {ram:?}  gpu {gpu:?}");
+        let traffic = traffic.sample();
+        let online = super::connectivity::Connectivity::new().online();
+        println!("cpu {cpu:?}  ram {ram:?}  gpu {gpu:?}  traffic {traffic:?}  online {online:?}");
         assert!(cpu.is_some_and(|v| (0.0..=100.0).contains(&v)));
         assert!(ram.is_some_and(|m| m.used <= m.total && m.total > 0));
+        assert!(traffic.is_some());
     }
 }

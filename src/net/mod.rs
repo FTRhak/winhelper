@@ -1,8 +1,10 @@
 //! Network identity lookup on a background thread (PLAN.md §4, §5.4–5.5).
 //!
 //! `Lookup` reads the LAN IP and asks the geo providers for the public IP and
-//! its location, once at start and again on every `refresh` (the
-//! "Refresh IP now" menu command). Each result is stored as the latest
+//! its location on every `refresh`. The thread starts idle: the panel asks for
+//! the first lookup once it is shown and its message loop runs, so startup
+//! never waits on or competes with the network. Later lookups come from the
+//! "Refresh IP now" menu command and from reconnects. Each result is stored as the latest
 //! `NetInfo` and announced with `WM_APP_NETINFO`.
 
 mod geo;
@@ -15,6 +17,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::win::Event;
@@ -29,6 +32,8 @@ pub struct NetInfo {
     pub lan_ip: Option<String>,
     /// `None` when every provider failed (offline, blocked, rate limited).
     pub public: Option<Geo>,
+    /// Local time the lookup finished, "14:02".
+    pub at: Option<String>,
 }
 
 struct Shared {
@@ -48,12 +53,12 @@ pub struct Lookup {
 }
 
 impl Lookup {
-    /// Starts the thread, which looks up once right away. `None` if it cannot
-    /// be started; the network rows then stay empty.
+    /// Starts the thread idle; nothing is looked up until the first `refresh`.
+    /// `None` if it cannot be started; the network rows then stay empty.
     pub fn start(panel: HWND) -> Option<Self> {
         let shared = Arc::new(Shared {
             latest: Mutex::new(None),
-            pending: AtomicBool::new(true),
+            pending: AtomicBool::new(false),
             busy: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             wake: Event::new().ok()?,
@@ -122,6 +127,7 @@ fn run(shared: &Shared, panel: isize) {
         let info = NetInfo {
             lan_ip: local::lan_ip(),
             public: session.as_ref().and_then(geo::lookup),
+            at: Some(local_time()),
         };
         if let Ok(mut latest) = shared.latest.lock() {
             *latest = Some(info);
@@ -133,6 +139,13 @@ fn run(shared: &Shared, panel: isize) {
             let _ = PostMessageW(HWND(panel as *mut _), WM_APP_NETINFO, WPARAM(0), LPARAM(0));
         }
     }
+}
+
+/// Current local time as "HH:MM".
+fn local_time() -> String {
+    // SAFETY: plain FFI call returning a struct by value.
+    let t = unsafe { GetLocalTime() };
+    format!("{:02}:{:02}", t.wHour, t.wMinute)
 }
 
 /// Queries the real providers: `cargo test -- --ignored --nocapture`.

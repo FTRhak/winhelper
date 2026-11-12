@@ -1,5 +1,7 @@
-//! Panel window: class, WndProc, dragging, hover / close button, tray, theme and
-//! DPI handling.
+//! Strip window: class, WndProc, dragging, hover / close button / detail
+//! tooltip, tray, theme and DPI handling.
+
+use std::time::Instant;
 
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -25,12 +27,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::close_button::{self, WM_APP_HIDE_PANEL};
 use super::gdi::{BackBuffer, PaintGuard};
-use super::layout::{PANEL_HEIGHT, PANEL_WIDTH};
+use super::layout::{STRIP_HEIGHT, STRIP_WIDTH};
 use super::menu::{self, Command, MenuState};
-use super::paint::{Fonts, PanelPaint};
+use super::paint::{Fonts, StripPaint};
 use super::scale;
 use super::state::{self, Ui};
 use super::theme;
+use super::tooltip;
 use super::tray::{self, WM_APP_TRAY};
 use super::view::PanelView;
 use crate::metrics::{Sampler, WM_APP_METRICS};
@@ -49,6 +52,11 @@ const IDI_APP: u16 = 1;
 /// leaves both windows (the gap between them makes leave events unreliable).
 const HOVER_TIMER: usize = 1;
 const HOVER_POLL_MS: u32 = 100;
+
+/// One-shot timer for the first network lookup. WM_TIMER is only dispatched
+/// by the running message loop, so the panel is shown and painted first.
+const NET_START_TIMER: usize = 2;
+const NET_START_DELAY_MS: u32 = 1000;
 
 /// Brings an already running instance's panel to the front.
 pub fn activate_existing() {
@@ -99,6 +107,7 @@ pub fn create() -> Result<HWND> {
             None,
         )?;
         let close = close_button::create(instance, hwnd)?;
+        let tip = tooltip::create(instance, hwnd)?;
 
         let dpi = GetDpiForWindow(hwnd);
         let theme = theme::system_theme();
@@ -114,11 +123,14 @@ pub fn create() -> Result<HWND> {
         state::init(Ui {
             panel: hwnd,
             close,
+            tip,
             dpi,
             theme,
             fonts: Fonts::new(dpi),
             view,
             hovered: false,
+            hover_since: None,
+            tip_shown: false,
             close_hovered: false,
             focused: false,
             sampler,
@@ -132,10 +144,14 @@ pub fn create() -> Result<HWND> {
         round_corners(hwnd, false);
         update_border(hwnd);
         update_border(close);
+        update_border(tip);
         tray::add(hwnd, IDI_APP);
 
         place_initial(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        if state::with(|ui| ui.net.is_some()) == Some(true) {
+            SetTimer(hwnd, NET_START_TIMER, NET_START_DELAY_MS, None);
+        }
         Ok(hwnd)
     }
 }
@@ -167,35 +183,45 @@ fn update_sampling(ui: &Ui) {
     }
 }
 
-/// WM_APP_METRICS: copy the newest snapshot into the view and repaint.
+/// WM_APP_METRICS: copy the newest snapshot into the view and repaint. When
+/// Windows reports internet access again after being offline, the public IP
+/// is looked up again (it may have changed).
 fn on_metrics(hwnd: HWND) {
     let changed = state::with(|ui| {
-        let Some(snap) = ui.sampler.as_ref().and_then(Sampler::take_latest) else {
-            return false;
-        };
-        let before = (ui.view.cpu, ui.view.ram, ui.view.gpu);
-        ui.view.cpu = snap.cpu;
-        ui.view.ram = snap.ram;
-        ui.view.gpu = snap.gpu;
-        before != (snap.cpu, snap.ram, snap.gpu)
+        let snap = ui.sampler.as_ref().and_then(Sampler::take_latest)?;
+        let v = &mut ui.view;
+        let before = (v.cpu, v.ram, v.gpu, v.traffic, v.online);
+        let reconnected = v.online == Some(false) && snap.online == Some(true);
+        v.cpu = snap.cpu;
+        v.ram = snap.ram;
+        v.gpu = snap.gpu;
+        v.traffic = snap.traffic;
+        v.online = snap.online;
+        if reconnected {
+            if let Some(net) = &ui.net {
+                net.refresh();
+            }
+        }
+        let after = (v.cpu, v.ram, v.gpu, v.traffic, v.online);
+        (before != after).then_some(ui.tip)
     });
-    if changed == Some(true) {
+    if let Some(Some(tip)) = changed {
         invalidate(hwnd);
+        invalidate(tip);
     }
 }
 
 /// WM_APP_NETINFO: merge the finished lookup into the view and repaint.
 fn on_netinfo(hwnd: HWND) {
     let changed = state::with(|ui| {
-        let Some(info) = ui.net.as_ref().and_then(Lookup::take_latest) else {
-            return false;
-        };
+        let info = ui.net.as_ref().and_then(Lookup::take_latest)?;
         let before = ui.view.net.clone();
         ui.view.net.update(info);
-        before != ui.view.net
+        (before != ui.view.net).then_some(ui.tip)
     });
-    if changed == Some(true) {
+    if let Some(Some(tip)) = changed {
         invalidate(hwnd);
+        invalidate(tip);
     }
 }
 
@@ -217,13 +243,15 @@ pub fn round_corners(hwnd: HWND, small: bool) {
     }
 }
 
-/// Matches the Windows 11 DWM border of the panel or close button to the
-/// current theme and hover state. No-op on Windows 10, where the painted 1 px
-/// border is the only one.
+/// Matches the Windows 11 DWM border of the strip, close button or tooltip to
+/// the current theme and hover state. No-op on Windows 10, where the painted
+/// 1 px border is the only one.
 pub fn update_border(hwnd: HWND) {
     let Some(color) = state::with(|ui| {
         let p = ui.theme.palette();
-        if hwnd == ui.close {
+        if hwnd == ui.tip {
+            p.tip_border
+        } else if hwnd == ui.close {
             if ui.close_hovered {
                 p.close_hover
             } else {
@@ -249,7 +277,7 @@ pub fn update_border(hwnd: HWND) {
 }
 
 fn panel_size(dpi: u32) -> (i32, i32) {
-    (scale(PANEL_WIDTH, dpi), scale(PANEL_HEIGHT, dpi))
+    (scale(STRIP_WIDTH, dpi), scale(STRIP_HEIGHT, dpi))
 }
 
 /// Sizes the panel for its monitor DPI and puts it in the top-right corner of the
@@ -291,7 +319,7 @@ fn on_paint(hwnd: HWND) {
         let Some(buffer) = BackBuffer::new(guard.hdc, width, height) else {
             return;
         };
-        PanelPaint {
+        StripPaint {
             width,
             height,
             dpi: ui.dpi,
@@ -305,11 +333,13 @@ fn on_paint(hwnd: HWND) {
     });
 }
 
-/// Cursor entered the panel: hover border on, close button shown.
+/// Cursor entered the strip: hover border on, close button shown; the hover
+/// timer opens the tooltip after `tooltip::DELAY`.
 fn on_hover(hwnd: HWND) {
     let Some((close, dpi)) = state::with(|ui| {
         (!ui.hovered).then(|| {
             ui.hovered = true;
+            ui.hover_since = Some(Instant::now());
             update_sampling(ui);
             (ui.close, ui.dpi)
         })
@@ -327,10 +357,12 @@ fn on_hover(hwnd: HWND) {
 }
 
 fn end_hover(hwnd: HWND) {
-    let Some(close) = state::with(|ui| {
+    let Some((close, tip)) = state::with(|ui| {
         ui.hovered = false;
+        ui.hover_since = None;
+        ui.tip_shown = false;
         update_sampling(ui);
-        ui.close
+        (ui.close, ui.tip)
     }) else {
         return;
     };
@@ -338,6 +370,7 @@ fn end_hover(hwnd: HWND) {
     unsafe {
         let _ = KillTimer(hwnd, HOVER_TIMER);
     }
+    tooltip::hide(tip);
     close_button::hide(close);
     update_border(hwnd);
     update_border(close);
@@ -358,6 +391,21 @@ fn on_hover_timer(hwnd: HWND) {
     };
     if !inside {
         end_hover(hwnd);
+        return;
+    }
+    // Open the tooltip once the cursor has rested long enough.
+    let due = state::with(|ui| {
+        let due = !ui.tip_shown
+            && ui
+                .hover_since
+                .is_some_and(|t| t.elapsed() >= tooltip::DELAY);
+        if due {
+            ui.tip_shown = true;
+        }
+        due.then_some((ui.tip, ui.dpi))
+    });
+    if let Some(Some((tip, dpi))) = due {
+        tooltip::show_near(tip, hwnd, dpi);
     }
 }
 
@@ -419,14 +467,27 @@ fn set_visible(hwnd: HWND, visible: bool) {
 }
 
 fn show_menu(hwnd: HWND, pt: POINT) {
-    let Some(menu_state) = state::with(|ui| MenuState {
-        topmost: ui.topmost,
-        opacity: ui.opacity,
-        can_refresh_ip: ui.net.is_some(),
+    // The tooltip would cover the menu; it comes back after a fresh hover delay.
+    let Some((menu_state, tip)) = state::with(|ui| {
+        ui.hover_since = None;
+        ui.tip_shown = false;
+        let menu_state = MenuState {
+            topmost: ui.topmost,
+            opacity: ui.opacity,
+            can_refresh_ip: ui.net.is_some(),
+        };
+        (menu_state, ui.tip)
     }) else {
         return;
     };
-    match menu::show(hwnd, pt, &menu_state) {
+    tooltip::hide(tip);
+    let command = menu::show(hwnd, pt, &menu_state);
+    state::with(|ui| {
+        if ui.hovered {
+            ui.hover_since = Some(Instant::now());
+        }
+    });
+    match command {
         Some(Command::ToggleTopmost) => toggle_topmost(hwnd),
         Some(Command::Opacity(level)) => set_opacity(level),
         Some(Command::RefreshIp) => {
@@ -444,17 +505,33 @@ fn show_menu(hwnd: HWND, pt: POINT) {
 
 fn on_theme_change(hwnd: HWND) {
     let theme = theme::system_theme();
-    let Some(close) = state::with(|ui| {
+    let Some((close, tip)) = state::with(|ui| {
         ui.theme = theme;
-        ui.close
+        (ui.close, ui.tip)
     }) else {
         return;
     };
     theme::apply_menu_theme(theme);
-    update_border(hwnd);
-    update_border(close);
-    invalidate(hwnd);
-    invalidate(close);
+    for w in [hwnd, close, tip] {
+        update_border(w);
+        invalidate(w);
+    }
+}
+
+/// Keeps the close button and an open tooltip next to the strip after it
+/// moved or changed size.
+fn follow_strip(hwnd: HWND) {
+    let Some((hovered, tip_shown, close, tip, dpi)) =
+        state::with(|ui| (ui.hovered, ui.tip_shown, ui.close, ui.tip, ui.dpi))
+    else {
+        return;
+    };
+    if hovered {
+        close_button::show_beside(close, hwnd, dpi);
+    }
+    if tip_shown {
+        tooltip::show_near(tip, hwnd, dpi);
+    }
 }
 
 /// `lparam` of WM_SETTINGCHANGE names the changed area; theme switches send
@@ -501,10 +578,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 on_hover_timer(hwnd);
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == NET_START_TIMER => {
+                let _ = KillTimer(hwnd, NET_START_TIMER);
+                state::with(|ui| ui.net.as_ref().map(Lookup::refresh));
+                LRESULT(0)
+            }
             WM_MOVE => {
-                if let Some((true, close, dpi)) = state::with(|ui| (ui.hovered, ui.close, ui.dpi)) {
-                    close_button::show_beside(close, hwnd, dpi);
-                }
+                follow_strip(hwnd);
                 LRESULT(0)
             }
             // Right-clicks on the HTCAPTION client area arrive as NC messages and do not
@@ -576,10 +656,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
                 invalidate(hwnd);
+                follow_strip(hwnd);
                 LRESULT(0)
             }
             WM_DESTROY => {
                 let _ = KillTimer(hwnd, HOVER_TIMER);
+                let _ = KillTimer(hwnd, NET_START_TIMER);
                 tray::remove(hwnd);
                 // Stop the worker threads (outside the state borrow).
                 drop(state::with(|ui| (ui.sampler.take(), ui.net.take())));

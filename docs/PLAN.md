@@ -5,7 +5,7 @@
 WinHelper is a small, always-available desktop panel for Windows 10/11 that shows at a glance:
 
 - **System load**: CPU usage, memory usage, GPU usage
-- **Network identity**: current public IP, local (LAN) IP, and the approximate geographic location of the public IP
+- **Network**: internet status, download / upload speed, current public IP, local (LAN) IP, and the approximate geographic location of the public IP
 
 Non-goals for v1: historical logging, per-process breakdown, alerts, multi-GPU detail views, cross-platform support.
 
@@ -19,25 +19,47 @@ Non-goals for v1: historical logging, per-process breakdown, alerts, multi-GPU d
 
 ## 2. UI concept
 
-The visual spec (exact sizes, colors, all states, close button, menu) lives in `design/WinHelper.bl` (Brilliant). A borderless panel of 220 × 174 px at 96 DPI (scaled for DPI):
+The visual spec (exact sizes, colors, all states, close button, menu) lives in `design/WinHelper.bl` (Brilliant), board **"WinHelper · Minimal"**. The older multi-row panel design on the same canvas is superseded.
+
+The panel is a minimalist one-line strip, 394 × 30 px at 96 DPI (scaled for DPI). Each item is only an icon and a value:
 
 ```
-┌──────────────────────────────┐
-│ CPU  ███████░░░░░░░░   42 %  │
-│ RAM  ██████████░░░░░   63 %  │
-│      10.1 / 16.0 GB          │
-│ GPU  ███░░░░░░░░░░░░   18 %  │
-│──────────────────────────────│
-│ IP   203.0.113.42            │
-│ LAN  192.168.1.15            │
-│ LOC  Kyiv, Ukraine 🇺🇦        │
-└──────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│ ▣ 42%  ▤ 63%  ▭ 18%  │  ◍ •  ↓ 1.2 MB/s  ↑  84 KB/s      │
+└───────────────────────────────────────────────────────────┘
+  CPU    RAM    GPU       internet   download   upload
+```
+
+Everything else lives in a **detail tooltip** (264 × 325 px) that opens below the strip after the cursor rests on it for 400 ms:
+
+```
+┌──────────────────────────────────┐
+│ SYSTEM                           │
+│ ▣ CPU                      42 %  │
+│ ████████░░░░░░░░░░░░░░░░░░░░░░░  │
+│ ▤ RAM        10.1 / 16.0 GB 63 % │
+│ ████████████░░░░░░░░░░░░░░░░░░░  │
+│ ▭ GPU                      18 %  │
+│ ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │
+│──────────────────────────────────│
+│ NETWORK                ● Online  │
+│ Public IP          203.0.113.42  │
+│ Location       Kyiv, Ukraine UA  │
+│ LAN IP             192.168.1.15  │
+│ ↓ Download             1.2 MB/s  │
+│ ↑ Upload                84 KB/s  │
+│──────────────────────────────────│
+│ IP updated 14:02 · right-click…  │
+└──────────────────────────────────┘
 ```
 
 Behavior:
 
 - Drag anywhere to move. Position is saved and restored on next launch.
-- Hovering the panel lightens its border and shows a 24 px close button 6 px beside it (flipped to the left near the work-area edge). Clicking it hides the panel to the tray; Exit stays in the menu.
+- Hovering the strip lightens its border and shows a 22 px close button 6 px beside it, vertically centered (flipped to the left near the work-area edge). Clicking it hides the strip to the tray; Exit stays in the menu.
+- The tooltip opens after 400 ms of hover, below the strip (above it near the bottom of the work area, shifted to stay inside it horizontally). It follows the strip when dragged, refreshes live while open, is click-through, and closes when the hover ends or the context menu opens.
+- Icons are Segoe MDL2 Assets glyphs (also in Segoe Fluent Icons): CPU `E950`, RAM `E964`, GPU `E7F4`, globe `E774`, arrows `E74B` / `E74A`. Numbers sit in fixed-width slots so the strip never shifts.
+- Internet status: green dot when online, red globe and dot when offline, gray while unknown. The transfer rates gray out while offline.
 - Right-click (panel or tray icon) opens a context menu:
   - Always on top (toggle)
   - Opacity: 100 % / 85 % / 70 %
@@ -46,7 +68,7 @@ Behavior:
   - Start with Windows (toggle)
   - Exit
 - Double-click the tray icon to show or hide the panel.
-- Bar colors change with load: green below 60 %, amber from 60 to 85 %, red above 85 %.
+- Load colors: on the strip the value stays neutral below 60 %, turns amber from 60 to 85 % and red above 85 % (the icon turns red too). Tooltip bars are green / amber / red at the same thresholds.
 - Follows the system light/dark theme (read `AppsUseLightTheme` from the registry).
 
 ---
@@ -63,6 +85,8 @@ Behavior:
 | HTTP | WinHTTP (`WinHttpOpen`/`WinHttpSendRequest`…) | Avoids `reqwest`/`tokio` and their binary size |
 | JSON | `serde_json` + `serde` (or a tiny manual parser) | Responses are small and flat |
 | Local IP | `GetAdaptersAddresses` (IP Helper) | |
+| Throughput | `GetIfTable2` (IP Helper) | Byte-counter deltas of physical interfaces |
+| Internet status | `GetNetworkConnectivityHint` (IP Helper, Win10 2004+) | Looked up at run time; falls back to the IP lookup result |
 | Network change events | `NotifyIpInterfaceChange` | Triggers an IP refresh |
 | Tray icon | `Shell_NotifyIconW` | |
 | Settings | INI/TOML file in `%APPDATA%\WinHelper\` | Or registry `HKCU\Software\WinHelper` |
@@ -76,8 +100,9 @@ Behavior:
 ```
 ┌────────────────────┐   WM_APP_METRICS    ┌─────────────────────┐
 │  Metrics thread    │ ──────────────────▶ │                     │
-│  (1 s interval)    │   PostMessageW      │   UI thread         │
-│  CPU / RAM / GPU   │                     │   (message loop,    │
+│  (1 s / 10 s)      │   PostMessageW      │   UI thread         │
+│  CPU / RAM / GPU,  │                     │   (message loop,    │
+│  traffic, online   │                     │                     │
 └────────────────────┘                     │    painting, tray,  │
 ┌────────────────────┐   WM_APP_NETINFO    │    context menu)    │
 │  Network thread    │ ──────────────────▶ │                     │
@@ -88,7 +113,7 @@ Behavior:
 ```
 
 - **UI thread** owns the window and only paints. It never blocks on I/O.
-- **Metrics thread** samples every 1 s while the panel is focused or hovered and every 10 s otherwise (the first sample always comes after 1 s). It writes a `MetricsSnapshot` into shared state, then posts `WM_APP_METRICS`, which leads to `InvalidateRect`. The UI flips the rate via `Sampler::set_active`; becoming active wakes the thread so it samples at once if the last sample is ≥ 1 s old. Samples are never closer than 1 s, so CPU/GPU deltas stay meaningful.
+- **Metrics thread** samples CPU / RAM / GPU, network throughput and internet connectivity every 1 s while the panel is focused or hovered and every 10 s otherwise (the first sample always comes after 1 s). When Windows reports internet access again after being offline, the UI asks the network thread for a new IP lookup. It writes a `MetricsSnapshot` into shared state, then posts `WM_APP_METRICS`, which leads to `InvalidateRect`. The UI flips the rate via `Sampler::set_active`; becoming active wakes the thread so it samples at once if the last sample is ≥ 1 s old. Samples are never closer than 1 s, so CPU/GPU deltas stay meaningful.
 - **Network thread** waits on a channel or event (startup, timer, network change callback, or "Refresh" menu command), performs the HTTP lookup with a timeout, and posts `WM_APP_NETINFO`.
 - Shutdown: a shared `AtomicBool` stop flag plus an event to wake the workers. The threads are joined in `WM_DESTROY`.
 
@@ -106,13 +131,14 @@ winhelper/
    ├─ win.rs                # RAII handle wrappers, single-instance mutex, error box
    ├─ app.rs                # App state, startup/shutdown orchestration
    ├─ ui/
-   │  ├─ window.rs          # panel class, WndProc, drag, hover, DPI, theme changes
-   │  ├─ close_button.rs    # hover close popup owned by the panel
+   │  ├─ window.rs          # strip class, WndProc, drag, hover, DPI, theme changes
+   │  ├─ close_button.rs    # hover close popup owned by the strip
+   │  ├─ tooltip.rs         # detail tooltip popup owned by the strip
    │  ├─ state.rs           # UI-thread state shared by the window procedures
    │  ├─ view.rs            # PanelView model + value formatting
-   │  ├─ layout.rs          # design metrics, close-button placement math
+   │  ├─ layout.rs          # design metrics, close-button / tooltip placement math
    │  ├─ theme/mod.rs       # dark/light palettes, load thresholds, menu theming
-   │  ├─ paint.rs           # panel and close-button drawing
+   │  ├─ paint.rs           # strip, tooltip and close-button drawing
    │  ├─ gdi.rs             # GDI RAII wrappers and draw helpers
    │  ├─ demo.rs            # debug-only sample data (WINHELPER_DEMO / WINHELPER_THEME)
    │  ├─ tray.rs            # Shell_NotifyIcon
@@ -121,7 +147,9 @@ winhelper/
    │  ├─ mod.rs             # MetricsSnapshot, sampler loop
    │  ├─ cpu.rs
    │  ├─ memory.rs
-   │  └─ gpu.rs             # PDH-based GPU utilization
+   │  ├─ gpu.rs             # PDH-based GPU utilization
+   │  ├─ traffic.rs         # GetIfTable2 byte-counter rates
+   │  └─ connectivity.rs    # GetNetworkConnectivityHint (loaded at run time)
    ├─ net/
    │  ├─ mod.rs             # NetInfo, refresh loop
    │  ├─ http.rs            # minimal WinHTTP GET wrapper
@@ -184,12 +212,19 @@ A single HTTPS request returns both the IP and the location:
 
 ipwho.is is primary because it returns the country name, which the "City, Country" row needs; ipinfo.io returns only the code.
 
-- Refresh triggers: app start, every 10 minutes, a network change event, or the manual "Refresh IP" command. Implemented so far: app start and the manual command.
+- Refresh triggers: app start (1 s after the panel is shown, so startup never waits on the network), every 10 minutes, a network change event, or the manual "Refresh IP" command. Implemented so far: app start, offline → online and the manual command.
 - Timeouts: 5 s each for resolve, connect, send and receive (`WinHttpSetTimeouts`). The system proxy is used (`WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY`).
 - Shutdown does not wait for a lookup that is mid-request; the thread is detached and ends with the process.
 - On failure, keep the last known values, gray them out, and show the error in the tooltip.
 - Make the provider list configurable in settings.
 - **Privacy**: the request reveals the user's IP to the third-party provider. State this in the README and add a setting to disable the public IP and location lookup.
+
+### 5.6 Throughput and internet status
+
+- **Throughput**: `GetIfTable2` each sample; sum the `InOctets` / `OutOctets` deltas of interfaces that are up, have `HardwareInterface` set, are not filter interfaces and are not loopback, then divide by the elapsed time. Filter and virtual interfaces (WFP filters, Hyper-V vEthernet, VPN adapters) would count the same bytes again; VPN traffic is still counted once, on the physical adapter that carries it. Interfaces are matched by LUID; one that is new or whose counters went backwards (adapter reset) adds nothing for that sample. The rate is an average over the sampling interval, so it is per 1 s while the strip is active and a 10 s average otherwise.
+- Display: binary units (1 KB = 1024 B) `B/s`, `KB/s`, `MB/s`, `GB/s`; one decimal below 10, so a number is at most 4 characters and fits its fixed slot.
+- **Internet status**: `GetNetworkConnectivityHint` → `InternetAccess` / `ConstrainedInternetAccess` = online, `None` / `LocalAccess` = offline, `Unknown` / `Hidden` = unknown. The function exists from Windows 10 2004, so it is resolved with `GetProcAddress`; when it is missing or the level is unknown, the status falls back to the last IP lookup (stale = offline, a known IP = online).
+- The offline → online transition triggers a public IP lookup (a cheap stand-in for the planned `NotifyIpInterfaceChange` trigger).
 
 ---
 
@@ -199,7 +234,8 @@ ipwho.is is primary because it returns the country name, which the "City, Countr
 - Dragging: return `HTCAPTION` from `WM_NCHITTEST` for the client area.
 - DPI: declare PerMonitorV2 in the manifest, handle `WM_DPICHANGED`, and scale all metrics via `GetDpiForWindow`.
 - Painting: in `WM_PAINT`, draw into a compatible memory bitmap and `BitBlt` it to the window. Return 1 from `WM_ERASEBKGND` to avoid flicker.
-- Font: `Segoe UI` 9 pt for labels and `Consolas` or `Cascadia Mono` for numbers, created once per DPI.
+- Font: `Segoe UI` for labels, `Consolas` for numbers and `Segoe MDL2 Assets` for icons, created once per DPI. The status dot is the `●` text glyph, because GDI shapes are not anti-aliased.
+- Tooltip: a separate `WS_POPUP` owned by the strip with `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE` (click-through, never activates) and `CS_DROPSHADOW`. It is shown from the 100 ms hover poll timer once the hover is 400 ms old.
 - Rounded corners on Win11: `DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)`.
 - Single instance: a named mutex `Local\WinHelper.SingleInstance`. If it already exists, bring the existing window to the front and exit.
 - Restore the saved position. If it is off-screen (for example, a monitor was disconnected), clamp it to the nearest monitor via `MonitorFromPoint`.
@@ -275,7 +311,9 @@ Targets: `x86_64-pc-windows-msvc` (primary) and `aarch64-pc-windows-msvc` (optio
 - **Integration and manual checks**:
   - Compare CPU, RAM, and GPU values against Task Manager under load (e.g. a stress tool or a game)
   - Switch Wi-Fi ↔ Ethernet and connect/disconnect a VPN; the IP and location should update within about 5 s
-  - Run offline; the app should keep running and show stale or N/A values
+  - Run offline; the app should keep running and show stale or N/A values, a red globe and grayed rates; reconnecting should turn the dot green and refresh the IP
+  - Compare download / upload speed with Task Manager's Ethernet / Wi-Fi graphs during a large download, also with a VPN connected (no double counting)
+  - Hover the strip near each screen edge: the tooltip opens after ~400 ms, flips above at the bottom edge, stays on screen, follows a drag, and hides when the cursor leaves or the menu opens
   - Test multi-monitor and mixed DPI (100 % / 150 %): drag between monitors and check that rendering stays crisp
   - Test with a localized (non-English) Windows UI to confirm the PDH English counter names work
 - **CI**: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo build --release` on `windows-latest`.
@@ -297,9 +335,7 @@ Targets: `x86_64-pc-windows-msvc` (primary) and `aarch64-pc-windows-msvc` (optio
 
 ## 11. Future ideas (post-v1)
 
-- Sparkline history (last 60 s) for each metric
-- Network throughput (up/down) via `GetIfTable2`
+- Sparkline history (last 60 s) for each metric, in the tooltip
 - Disk activity and free space
 - CPU/GPU temperature (needs vendor APIs or WMI; non-trivial)
-- Compact mode showing a single line
 - Click-through mode (`WS_EX_TRANSPARENT`) for gaming overlays

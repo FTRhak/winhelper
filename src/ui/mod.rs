@@ -1,4 +1,4 @@
-//! User interface: panel window, close button, painting, tray and menus.
+//! User interface: strip window, detail tooltip, close button, painting, tray and menus.
 //! Visual spec: design/WinHelper.bl.
 
 mod close_button;
@@ -10,6 +10,7 @@ mod menu;
 mod paint;
 mod state;
 mod theme;
+mod tooltip;
 mod tray;
 mod view;
 pub mod window;

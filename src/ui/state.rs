@@ -1,10 +1,11 @@
-//! UI-thread state shared by the panel and close-button window procedures.
+//! UI-thread state shared by the panel, close-button and tooltip window procedures.
 //!
 //! Access goes through `with`, which never holds the borrow across a call that
 //! can re-enter a window procedure (SetWindowPos, ShowWindow, TrackPopupMenu, ...):
 //! callers copy what they need out, release the borrow, then call Win32.
 
 use std::cell::RefCell;
+use std::time::Instant;
 
 use windows::Win32::Foundation::HWND;
 
@@ -17,12 +18,19 @@ use crate::net::Lookup;
 pub struct Ui {
     pub panel: HWND,
     pub close: HWND,
+    /// Detail tooltip popup.
+    pub tip: HWND,
     pub dpi: u32,
     pub theme: Theme,
     pub fonts: Fonts,
     pub view: PanelView,
     /// Cursor is over the panel (or its close button): hover border + close shown.
     pub hovered: bool,
+    /// When the current hover started; `None` while not hovered or while the
+    /// context menu is open (the tooltip waits for a fresh hover delay).
+    pub hover_since: Option<Instant>,
+    /// The tooltip is visible.
+    pub tip_shown: bool,
     /// Cursor is over the close button itself.
     pub close_hovered: bool,
     /// The panel is the active (foreground) window.

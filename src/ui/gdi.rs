@@ -174,6 +174,11 @@ pub fn round_rect(dc: HDC, r: &RECT, radius: i32, color: COLORREF) {
 
 /// Draws single-line text; `flags` adds alignment / ellipsis to the defaults.
 pub fn text(dc: HDC, font: &Font, color: COLORREF, r: &RECT, s: &str, flags: DRAW_TEXT_FORMAT) {
+    // DrawTextW faults on an empty buffer (the slice pointer is dangling and the
+    // count is zero); there is nothing to draw anyway.
+    if s.is_empty() {
+        return;
+    }
     let mut wide: Vec<u16> = s.encode_utf16().collect();
     let mut rect = *r;
     // SAFETY: the font is valid and restored before returning.
@@ -192,6 +197,9 @@ pub fn text(dc: HDC, font: &Font, color: COLORREF, r: &RECT, s: &str, flags: DRA
 
 /// Width of `s` in `font`, in device pixels.
 pub fn text_width(dc: HDC, font: &Font, s: &str) -> i32 {
+    if s.is_empty() {
+        return 0;
+    }
     let mut wide: Vec<u16> = s.encode_utf16().collect();
     let mut rect = RECT::default();
     // SAFETY: as in `text`; DT_CALCRECT only measures.
